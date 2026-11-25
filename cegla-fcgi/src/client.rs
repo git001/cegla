@@ -261,9 +261,22 @@ fn answer<T>(ch: oneshot::Sender<T>, result: T) {
 // ---------------------------------------------------------------------------
 
 /// Represents a handle to send requests to a FastCGI server.
+///
+/// Clones send over the same connection, which ends once every handle is
+/// dropped and its requests have finished.
 pub struct SendRequest<B> {
   send_request_tx: async_channel::Sender<SentRequest<B>>,
   shared: Arc<Shared>,
+}
+
+// Not derived: that would need `B: Clone`.
+impl<B> Clone for SendRequest<B> {
+  fn clone(&self) -> Self {
+    Self {
+      send_request_tx: self.send_request_tx.clone(),
+      shared: Arc::clone(&self.shared),
+    }
+  }
 }
 
 impl<B> SendRequest<B>
@@ -1888,6 +1901,53 @@ mod tests {
     assert!(!send_req.is_ready());
 
     drop(connection_task);
+  }
+
+  #[tokio::test]
+  async fn test_cloned_handle_shares_the_connection() {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let server = tokio::spawn(serve_requests(server_io, &[], None));
+    let (send_req, connection) = Builder::new()
+      .keepalive(true)
+      .max_requests(4)
+      .handshake::<_, http_body_util::Full<Bytes>>(client_io)
+      .await
+      .unwrap();
+    let connection = tokio::spawn(connection);
+    let clone = send_req.clone();
+
+    // A clone sees the connection's limit and the original's requests.
+    assert_eq!(clone.max_requests(), 4);
+    {
+      use futures_util::FutureExt;
+      let mut pending = Vec::new();
+      for _ in 0..4 {
+        let request = http::Request::builder()
+          .uri("http://example.com/")
+          .body(http_body_util::Full::<Bytes>::from(b"".as_ref()))
+          .unwrap();
+        let mut response = Box::pin(send_req.send_request(request, CgiBuilder::new()));
+        assert!((&mut response).now_or_never().is_none());
+        pending.push(response);
+      }
+      assert!(!clone.is_ready());
+      for response in futures_util::future::join_all(pending).await {
+        response.unwrap();
+      }
+    }
+
+    // Both handles' requests are open on the one connection at once.
+    let (original_results, clone_results) = tokio::join!(send_requests(&send_req, 2), send_requests(&clone, 2));
+    assert!(original_results.iter().chain(&clone_results).all(Result::is_ok));
+
+    // The connection outlives the original handle while a clone is left.
+    drop(send_req);
+    assert!(!clone.is_closed());
+    assert!(send_requests(&clone, 1).await[0].is_ok());
+
+    drop(clone);
+    connection.await.unwrap().unwrap();
+    assert_eq!(server.await.unwrap(), 4);
   }
 }
 
