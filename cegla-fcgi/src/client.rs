@@ -12,7 +12,7 @@ use std::{
 };
 
 use cegla::{client::convert_to_http_response, CgiIncoming};
-use futures_util::{stream::FuturesUnordered, Sink, StreamExt};
+use futures_util::{stream::FuturesUnordered, Sink, SinkExt, StreamExt};
 use http_body::Body;
 use http_body_util::BodyExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, ReadHalf, WriteHalf};
@@ -25,7 +25,7 @@ pub use cegla::client::CgiBuilder;
 
 use crate::protocol::{
   codec::{Decoder, Encoder},
-  constants::{RecordType, Role, FCGI_KEEP_CONN},
+  constants::{RecordType, Role, FCGI_KEEP_CONN, FCGI_MAX_REQS, FCGI_MPXS_CONNS, FCGI_NULL_REQUEST_ID},
   id_alloc::IdAllocator,
   name_value_pair::NameValuePair,
   record::Record,
@@ -692,11 +692,69 @@ where
   Builder::new().keepalive(keepalive).handshake(io).await
 }
 
+/// What a server told about itself in `FCGI_GET_VALUES_RESULT`.
+#[derive(Debug, Default)]
+struct ServerValues {
+  // FCGI_MPXS_CONNS
+  multiplexes: Option<bool>,
+  // FCGI_MAX_REQS
+  max_requests: Option<usize>,
+}
+
+/// Sends `FCGI_GET_VALUES` and reads the answer.  A server that doesn't know
+/// the record type answers `FCGI_UNKNOWN_TYPE`, which tells nothing.
+async fn get_values<R, W>(
+  reader: &mut FramedRead<R, Decoder>,
+  writer: &mut FramedWrite<W, Encoder>,
+) -> Result<ServerValues, std::io::Error>
+where
+  R: AsyncRead + Unpin,
+  W: AsyncWrite + Unpin,
+{
+  let mut query = Vec::new();
+  for name in [FCGI_MAX_REQS, FCGI_MPXS_CONNS] {
+    query.extend_from_slice(&NameValuePair::from_slices(name.as_bytes(), b"").encode());
+  }
+  writer
+    .send(Record::new(RecordType::GetValues.as_u8(), FCGI_NULL_REQUEST_ID, query))
+    .await?;
+
+  loop {
+    let record = reader.next().await.ok_or_else(|| {
+      std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "connection closed before FCGI_GET_VALUES_RESULT",
+      )
+    })??;
+    if record.request_id != FCGI_NULL_REQUEST_ID {
+      // Not an answer to the query.
+      continue;
+    }
+    match RecordType::from_u8(record.record_type) {
+      Some(RecordType::GetValuesResult) => {
+        let mut values = ServerValues::default();
+        let mut content = std::io::Cursor::new(record.content);
+        while let Some(nvp) = NameValuePair::decode(&mut content)? {
+          if nvp.name == FCGI_MPXS_CONNS.as_bytes() {
+            values.multiplexes = Some(nvp.value == b"1");
+          } else if nvp.name == FCGI_MAX_REQS.as_bytes() {
+            values.max_requests = std::str::from_utf8(&nvp.value).ok().and_then(|v| v.parse().ok());
+          }
+        }
+        return Ok(values);
+      }
+      Some(RecordType::UnknownType) => return Ok(ServerValues::default()),
+      _ => continue,
+    }
+  }
+}
+
 /// Options for a FastCGI client connection.
 #[derive(Debug, Clone)]
 pub struct Builder {
   keepalive: bool,
   max_requests: usize,
+  get_values: bool,
 }
 
 impl Default for Builder {
@@ -711,6 +769,7 @@ impl Builder {
     Self {
       keepalive: false,
       max_requests: usize::MAX,
+      get_values: false,
     }
   }
 
@@ -729,6 +788,19 @@ impl Builder {
     self
   }
 
+  /// Asks the server during the handshake how many requests it runs at the
+  /// same time on one connection (`FCGI_MAX_REQS`, `FCGI_MPXS_CONNS`).  A
+  /// server that doesn't multiplex connections gets one request at a time,
+  /// and the limit is the smaller of `FCGI_MAX_REQS` and
+  /// [`max_requests`](Self::max_requests).  A server that doesn't know the
+  /// query leaves the limit as it is.
+  ///
+  /// The handshake then waits for the answer, so wrap it in a timeout.
+  pub fn get_values(&mut self, enabled: bool) -> &mut Self {
+    self.get_values = enabled;
+    self
+  }
+
   /// Performs the FastCGI handshake and returns a handle to send requests and
   /// a connection future.
   ///
@@ -742,12 +814,27 @@ impl Builder {
     B::Data: AsRef<[u8]> + Send + 'static,
   {
     let (reader, writer) = tokio::io::split(io);
-    let framed_read = FramedRead::new(reader, Decoder::default());
-    let framed_write = FramedWrite::new(writer, Encoder);
+    let mut framed_read = FramedRead::new(reader, Decoder::default());
+    let mut framed_write = FramedWrite::new(writer, Encoder);
+    let max_requests = if self.get_values {
+      match get_values(&mut framed_read, &mut framed_write).await? {
+        ServerValues {
+          multiplexes: Some(false),
+          ..
+        } => 1,
+        ServerValues {
+          max_requests: Some(max),
+          ..
+        } => self.max_requests.min(max.max(1)),
+        ServerValues { .. } => self.max_requests,
+      }
+    } else {
+      self.max_requests
+    };
     let (send_request_tx, send_request_rx) = async_channel::unbounded();
     let shared = Arc::new(Shared {
       in_flight: AtomicUsize::new(0),
-      max_requests: AtomicUsize::new(self.max_requests),
+      max_requests: AtomicUsize::new(max_requests),
     });
 
     Ok((
@@ -1318,8 +1405,10 @@ mod tests {
 
   /// A FastCGI server for tests.  Once it has read all records sent so far,
   /// it answers every request whose STDIN has ended with the request ID as
-  /// the body.  It returns the most requests that were open at the same time.
-  async fn serve_requests(io: tokio::io::DuplexStream) -> usize {
+  /// the body.  It answers `FCGI_GET_VALUES` with `values`, or with
+  /// `FCGI_UNKNOWN_TYPE` if there are none.  It returns the most requests that
+  /// were open at the same time.
+  async fn serve_requests(io: tokio::io::DuplexStream, values: &[(&str, &str)]) -> usize {
     use futures_util::{FutureExt, SinkExt};
 
     let (reader, writer) = tokio::io::split(io);
@@ -1336,6 +1425,23 @@ mod tests {
       }
       for record in records {
         match RecordType::from_u8(record.record_type) {
+          Some(RecordType::GetValues) if values.is_empty() => {
+            let content = vec![RecordType::GetValues.as_u8(), 0, 0, 0, 0, 0, 0, 0];
+            writer
+              .send(Record::new(RecordType::UnknownType.as_u8(), 0, content))
+              .await
+              .unwrap();
+          }
+          Some(RecordType::GetValues) => {
+            let mut content = Vec::new();
+            for (name, value) in values {
+              content.extend_from_slice(&NameValuePair::from_slices(name.as_bytes(), value.as_bytes()).encode());
+            }
+            writer
+              .send(Record::new(RecordType::GetValuesResult.as_u8(), 0, content))
+              .await
+              .unwrap();
+          }
           Some(RecordType::BeginRequest) => open.push(record.request_id),
           Some(RecordType::Stdin) if record.content.is_empty() => answerable.push(record.request_id),
           _ => {}
@@ -1359,14 +1465,17 @@ mod tests {
   }
 
   /// Sends `requests` requests at once through a connection made by
-  /// `builder`, and returns the most the server saw open at the same time.
-  async fn run_requests(builder: &Builder, requests: usize) -> usize {
+  /// `builder` to a server that answers `FCGI_GET_VALUES` with `values`.
+  /// Returns the connection's limit and the most requests the server saw open
+  /// at the same time.
+  async fn run_requests(builder: &Builder, values: &'static [(&str, &str)], requests: usize) -> (usize, usize) {
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
-    let server = tokio::spawn(serve_requests(server_io));
+    let server = tokio::spawn(serve_requests(server_io, values));
     let (send_req, connection) = builder
       .handshake::<_, http_body_util::Full<Bytes>>(client_io)
       .await
       .unwrap();
+    let max_requests = send_req.max_requests();
     let connection = tokio::spawn(connection);
 
     let responses = (0..requests).map(|_| async {
@@ -1384,18 +1493,41 @@ mod tests {
 
     drop(send_req);
     connection.await.unwrap().unwrap();
-    server.await.unwrap()
+    (max_requests, server.await.unwrap())
   }
 
   #[tokio::test]
   async fn test_requests_run_at_once_without_limit() {
-    assert_eq!(run_requests(&Builder::new(), 3).await, 3);
+    assert_eq!(run_requests(&Builder::new(), &[], 3).await.1, 3);
   }
 
   #[tokio::test]
   async fn test_max_requests_limits_open_requests() {
-    assert_eq!(run_requests(Builder::new().max_requests(2), 5).await, 2);
-    assert_eq!(run_requests(Builder::new().max_requests(1), 3).await, 1);
+    assert_eq!(run_requests(Builder::new().max_requests(2), &[], 5).await, (2, 2));
+    assert_eq!(run_requests(Builder::new().max_requests(1), &[], 3).await, (1, 1));
+  }
+
+  #[tokio::test]
+  async fn test_get_values_from_multiplexing_server() {
+    let values = &[("FCGI_MPXS_CONNS", "1"), ("FCGI_MAX_REQS", "2")];
+    assert_eq!(run_requests(Builder::new().get_values(true), values, 5).await, (2, 2));
+    // The smaller limit wins.
+    let values = &[("FCGI_MPXS_CONNS", "1"), ("FCGI_MAX_REQS", "50")];
+    let builder = Builder::new().get_values(true).max_requests(3).clone();
+    assert_eq!(run_requests(&builder, values, 5).await, (3, 3));
+  }
+
+  #[tokio::test]
+  async fn test_get_values_from_server_without_multiplexing() {
+    // php-fpm's answer.
+    let values = &[("FCGI_MAX_REQS", "5"), ("FCGI_MPXS_CONNS", "0")];
+    assert_eq!(run_requests(Builder::new().get_values(true), values, 3).await, (1, 1));
+  }
+
+  #[tokio::test]
+  async fn test_get_values_unknown_to_server() {
+    let builder = Builder::new().get_values(true).max_requests(2).clone();
+    assert_eq!(run_requests(&builder, &[], 4).await, (2, 2));
   }
 
   #[tokio::test]
