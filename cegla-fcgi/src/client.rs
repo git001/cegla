@@ -5,14 +5,14 @@ use std::{
   future::Future,
   pin::Pin,
   sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
   },
   task::{Context, Poll},
 };
 
 use cegla::{client::convert_to_http_response, CgiIncoming};
-use futures_util::{stream::FuturesUnordered, Sink, SinkExt, StreamExt};
+use futures_util::{stream::FuturesUnordered, task::AtomicWaker, Sink, SinkExt, StreamExt};
 use http_body::Body;
 use http_body_util::BodyExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, ReadHalf, WriteHalf};
@@ -47,6 +47,19 @@ pub struct FcgiResponseReader {
   leftover: Option<(Vec<u8>, usize)>,
   // Whether the end-of-stream sentinel has arrived.
   ended: bool,
+  // For the stdout reader: the connection to wake when the reader is
+  // dropped, so it can abort a request whose response nobody reads.
+  wake_on_drop: Option<Arc<Shared>>,
+}
+
+impl Drop for FcgiResponseReader {
+  fn drop(&mut self) {
+    if let Some(shared) = self.wake_on_drop.take() {
+      // Close first, so the connection sees the reader gone when it wakes.
+      self.rx.close();
+      shared.waker.wake();
+    }
+  }
 }
 
 // SAFETY: FcgiResponseReader only contains a pinned box (heap-allocated) and
@@ -119,8 +132,10 @@ struct PendingRequest<B> {
   stderr_tx: async_channel::Sender<Option<Vec<u8>>>,
   // Whether the `FCGI_END_REQUEST` record has been received.
   end_received: bool,
-  // Whether the stdout end-of-stream sentinel has been sent.
+  // Whether the empty `FCGI_STDOUT` record has been received.
   stdout_ended: bool,
+  // Whether `FCGI_ABORT_REQUEST` has been sent.
+  aborted: bool,
   // Futures that convert the accumulated stdout into an HTTP response and
   // deliver it through the oneshot channel.
   response_futures: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
@@ -165,6 +180,12 @@ struct Shared {
   in_flight: AtomicUsize,
   // The most requests the connection runs at the same time.
   max_requests: AtomicUsize,
+  // The connection's task, for a dropped stdout reader to wake.
+  waker: AtomicWaker,
+  // Whether the server said it multiplexes connections (FCGI_MPXS_CONNS).
+  // Only such a server is sure to take FCGI_ABORT_REQUEST: php-fpm reads it
+  // as the start of the next request and closes a kept-alive connection.
+  multiplexes: AtomicBool,
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +334,7 @@ where
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
     let mut this = self.project();
+    this.shared.waker.register(cx.waker());
 
     // ------------------------------------------------------------------
     // 1. Accept new requests from SendRequest handles
@@ -418,6 +440,7 @@ where
             rx: Box::pin(stdout_rx),
             leftover: None,
             ended: false,
+            wake_on_drop: Some(Arc::clone(this.shared)),
           };
 
           // Spawn the response-conversion future inside the Connection so it
@@ -434,6 +457,7 @@ where
                     rx: Box::pin(stderr_rx),
                     leftover: None,
                     ended: false,
+                    wake_on_drop: None,
                   },
                 )
               }));
@@ -452,6 +476,7 @@ where
               stderr_tx,
               end_received: false,
               stdout_ended: false,
+              aborted: false,
               response_futures,
               res_ch,
             },
@@ -587,6 +612,7 @@ where
                   Some(ProtocolStatus::CantMpxConn) => {
                     // The server takes one request at a time.
                     this.shared.max_requests.store(1, Ordering::Relaxed);
+                    this.shared.multiplexes.store(false, Ordering::Relaxed);
                   }
                   Some(ProtocolStatus::Overloaded | ProtocolStatus::UnknownRole) => {
                     // The server asks not to send more requests on this
@@ -631,6 +657,22 @@ where
     let mut finished_ids: Vec<u16> = Vec::new();
     for (&request_id, pending) in this.pending.iter_mut() {
       while let Poll::Ready(Some(())) = pending.response_futures.poll_next_unpin(cx) {}
+
+      // The response was dropped before it ended: the server can stop.
+      if this.shared.multiplexes.load(Ordering::Relaxed)
+        && !pending.aborted
+        && !pending.stdout_ended
+        && !pending.end_received
+        && pending.stdout_tx.is_closed()
+      {
+        pending.aborted = true;
+        pending.body = None;
+        this
+          .write_queue
+          .push_back(Record::new(RecordType::AbortRequest.as_u8(), request_id, vec![]));
+        // Flush the write queue.
+        cx.waker().wake_by_ref();
+      }
 
       // A request is fully done when END_REQUEST arrived and all response
       // futures have completed.
@@ -872,25 +914,28 @@ impl Builder {
     let (reader, writer) = tokio::io::split(io);
     let mut framed_read = FramedRead::new(reader, Decoder::default());
     let mut framed_write = FramedWrite::new(writer, Encoder);
-    let max_requests = if self.get_values {
-      match get_values(&mut framed_read, &mut framed_write).await? {
-        ServerValues {
-          multiplexes: Some(false),
-          ..
-        } => 1,
-        ServerValues {
-          max_requests: Some(max),
-          ..
-        } => self.max_requests.min(max.max(1)),
-        ServerValues { .. } => self.max_requests,
-      }
+    let values = if self.get_values {
+      get_values(&mut framed_read, &mut framed_write).await?
     } else {
-      self.max_requests
+      ServerValues::default()
+    };
+    let max_requests = match values {
+      ServerValues {
+        multiplexes: Some(false),
+        ..
+      } => 1,
+      ServerValues {
+        max_requests: Some(max),
+        ..
+      } => self.max_requests.min(max.max(1)),
+      ServerValues { .. } => self.max_requests,
     };
     let (send_request_tx, send_request_rx) = async_channel::unbounded();
     let shared = Arc::new(Shared {
       in_flight: AtomicUsize::new(0),
       max_requests: AtomicUsize::new(max_requests),
+      waker: AtomicWaker::new(),
+      multiplexes: AtomicBool::new(values.multiplexes == Some(true)),
     });
 
     Ok((
@@ -1003,6 +1048,8 @@ mod tests {
       shared: Arc::new(Shared {
         in_flight: AtomicUsize::new(0),
         max_requests: AtomicUsize::new(usize::MAX),
+        waker: AtomicWaker::new(),
+        multiplexes: AtomicBool::new(false),
       }),
       write_queue: VecDeque::new(),
       stdout_send: None,
@@ -1506,6 +1553,7 @@ mod tests {
           }
           Some(RecordType::BeginRequest) => open.push(record.request_id),
           Some(RecordType::Stdin) if record.content.is_empty() => answerable.push(record.request_id),
+          Some(RecordType::AbortRequest) => panic!("unexpected FCGI_ABORT_REQUEST"),
           _ => {}
         }
       }
@@ -1684,6 +1732,136 @@ mod tests {
       connection.await.unwrap().unwrap();
       server.await.unwrap();
     }
+  }
+
+  /// A FastCGI server for tests that answers `FCGI_GET_VALUES` with
+  /// `values` and starts one response, which ends STDOUT if `end_stdout`.  It
+  /// sends `FCGI_END_REQUEST` only once `end` fires, and returns whether an
+  /// `FCGI_ABORT_REQUEST` had arrived by then.
+  async fn serve_held_response(
+    io: tokio::io::DuplexStream,
+    values: &[(&str, &str)],
+    end_stdout: bool,
+    end: tokio::sync::oneshot::Receiver<()>,
+  ) -> bool {
+    use futures_util::{FutureExt, SinkExt};
+
+    let (reader, writer) = tokio::io::split(io);
+    let mut reader = FramedRead::new(reader, Decoder::default());
+    let mut writer = FramedWrite::new(writer, Encoder);
+    let mut request_id = None;
+    while let Some(record) = reader.next().await {
+      let record = record.unwrap();
+      match RecordType::from_u8(record.record_type) {
+        Some(RecordType::GetValues) => {
+          let mut content = Vec::new();
+          for (name, value) in values {
+            content.extend_from_slice(&NameValuePair::from_slices(name.as_bytes(), value.as_bytes()).encode());
+          }
+          writer
+            .send(Record::new(RecordType::GetValuesResult.as_u8(), 0, content))
+            .await
+            .unwrap();
+        }
+        Some(RecordType::Stdin) if record.content.is_empty() => {
+          request_id = Some(record.request_id);
+          break;
+        }
+        _ => {}
+      }
+    }
+    let request_id = request_id.unwrap();
+    let mut records = vec![Record::new(
+      RecordType::Stdout.as_u8(),
+      request_id,
+      b"Content-Type: text/plain\r\n\r\nstarted".to_vec(),
+    )];
+    if end_stdout {
+      records.push(Record::new(RecordType::Stdout.as_u8(), request_id, vec![]));
+    }
+    for record in records {
+      writer.send(record).await.unwrap();
+    }
+
+    end.await.unwrap();
+    let mut aborted = false;
+    while let Some(Some(record)) = reader.next().now_or_never() {
+      aborted |= record.unwrap().record_type == RecordType::AbortRequest.as_u8();
+    }
+    let end_request = vec![0, 0, 0, 0, ProtocolStatus::RequestComplete.as_u8(), 0, 0, 0];
+    writer
+      .send(Record::new(RecordType::EndRequest.as_u8(), request_id, end_request))
+      .await
+      .unwrap();
+    aborted
+  }
+
+  /// Gets a response from [`serve_held_response`] through a connection made
+  /// by `builder`, reads its body if `read_body`, drops it, and returns
+  /// whether the server got `FCGI_ABORT_REQUEST`.
+  async fn drop_held_response(
+    builder: &Builder,
+    values: &'static [(&str, &str)],
+    end_stdout: bool,
+    read_body: bool,
+  ) -> bool {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(serve_held_response(server_io, values, end_stdout, end_rx));
+    let (send_req, connection) = builder
+      .handshake::<_, http_body_util::Full<Bytes>>(client_io)
+      .await
+      .unwrap();
+    let connection = tokio::spawn(connection);
+
+    let request = http::Request::builder()
+      .method("GET")
+      .uri("http://example.com/")
+      .body(http_body_util::Full::<Bytes>::from(b"".as_ref()))
+      .unwrap();
+    let (response, _stderr_reader) = send_req.send_request(request, CgiBuilder::new()).await.unwrap();
+    if read_body {
+      let body = response.into_body().collect().await.unwrap().to_bytes();
+      assert_eq!(body.as_ref(), b"started");
+    } else {
+      drop(response);
+    }
+    // Nothing more arrives from the server, so only the dropped reader can
+    // wake the connection.
+    for _ in 0..10 {
+      tokio::task::yield_now().await;
+    }
+    end_tx.send(()).unwrap();
+
+    let aborted = server.await.unwrap();
+    drop(send_req);
+    connection.await.unwrap().unwrap();
+    aborted
+  }
+
+  const MULTIPLEXES: &[(&str, &str)] = &[("FCGI_MPXS_CONNS", "1")];
+
+  #[tokio::test]
+  async fn test_dropped_response_aborts_request() {
+    let builder = Builder::new().keepalive(true).get_values(true).clone();
+    assert!(drop_held_response(&builder, MULTIPLEXES, false, false).await);
+  }
+
+  #[tokio::test]
+  async fn test_response_read_to_the_end_is_not_aborted() {
+    // STDOUT has ended, but END_REQUEST is still to come.
+    let builder = Builder::new().keepalive(true).get_values(true).clone();
+    assert!(!drop_held_response(&builder, MULTIPLEXES, true, true).await);
+  }
+
+  #[tokio::test]
+  async fn test_no_abort_without_multiplexing() {
+    // php-fpm doesn't know FCGI_ABORT_REQUEST, and would read it as the
+    // start of the next request on a kept-alive connection.
+    let builder = Builder::new().keepalive(true).clone();
+    assert!(!drop_held_response(&builder, &[], false, false).await);
+    let builder = Builder::new().keepalive(true).get_values(true).clone();
+    assert!(!drop_held_response(&builder, &[("FCGI_MPXS_CONNS", "0")], false, false).await);
   }
 
   #[tokio::test]
