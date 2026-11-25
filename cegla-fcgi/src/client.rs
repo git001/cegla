@@ -25,7 +25,7 @@ pub use cegla::client::CgiBuilder;
 
 use crate::protocol::{
   codec::{Decoder, Encoder},
-  constants::{RecordType, Role, FCGI_KEEP_CONN, FCGI_MAX_REQS, FCGI_MPXS_CONNS, FCGI_NULL_REQUEST_ID},
+  constants::{ProtocolStatus, RecordType, Role, FCGI_KEEP_CONN, FCGI_MAX_REQS, FCGI_MPXS_CONNS, FCGI_NULL_REQUEST_ID},
   id_alloc::IdAllocator,
   name_value_pair::NameValuePair,
   record::Record,
@@ -124,7 +124,36 @@ struct PendingRequest<B> {
   // Futures that convert the accumulated stdout into an HTTP response and
   // deliver it through the oneshot channel.
   response_futures: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
+  // The channel for the response, until a response future or a rejection
+  // takes it.
+  res_ch: Arc<std::sync::Mutex<Option<oneshot::Sender<ResponseResult>>>>,
 }
+
+/// The response to a request and the reader for its stderr.
+type ResponseResult = Result<
+  (
+    http::Response<CgiIncoming<cegla::client::CgiResponseInner<FcgiResponseReader>>>,
+    FcgiResponseReader,
+  ),
+  std::io::Error,
+>;
+
+/// The FastCGI server rejected a request: its `FCGI_END_REQUEST` record had
+/// the protocol status `FCGI_CANT_MPX_CONN`, `FCGI_OVERLOADED` or
+/// `FCGI_UNKNOWN_ROLE`.
+///
+/// [`SendRequest::send_request`] returns it inside a [`std::io::Error`]; get
+/// it with [`std::io::Error::get_ref`] and `downcast_ref`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestRejected(pub ProtocolStatus);
+
+impl std::fmt::Display for RequestRejected {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "FastCGI server rejected the request: {}", self.0)
+  }
+}
+
+impl std::error::Error for RequestRejected {}
 
 // ---------------------------------------------------------------------------
 // Shared (state of SendRequest handles and their Connection)
@@ -142,19 +171,10 @@ struct Shared {
 // SentRequest (internal message from SendRequest → Connection)
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::type_complexity)]
 struct SentRequest<B> {
   req: http::Request<B>,
   builder: CgiBuilder,
-  res_ch: oneshot::Sender<
-    Result<
-      (
-        http::Response<CgiIncoming<cegla::client::CgiResponseInner<FcgiResponseReader>>>,
-        FcgiResponseReader,
-      ),
-      std::io::Error,
-    >,
-  >,
+  res_ch: oneshot::Sender<ResponseResult>,
 }
 
 // ---------------------------------------------------------------------------
@@ -402,7 +422,8 @@ where
 
           // Spawn the response-conversion future inside the Connection so it
           // is driven without a separate task.
-          let res_ch_cell = std::sync::Mutex::new(Some(res_ch));
+          let res_ch = Arc::new(std::sync::Mutex::new(Some(res_ch)));
+          let res_ch_cell = Arc::clone(&res_ch);
           let response_future: Pin<Box<dyn Future<Output = ()> + Send + 'static>> = Box::pin(async move {
             let result = convert_to_http_response(reader).await;
             if let Some(ch) = res_ch_cell.lock().unwrap().take() {
@@ -432,6 +453,7 @@ where
               end_received: false,
               stdout_ended: false,
               response_futures,
+              res_ch,
             },
           );
         }
@@ -559,6 +581,32 @@ where
                   debug_assert!(err.is_closed());
                 }
                 pending.end_received = true;
+
+                let status = record.content.get(4).copied().and_then(ProtocolStatus::from_u8);
+                match status {
+                  Some(ProtocolStatus::CantMpxConn) => {
+                    // The server takes one request at a time.
+                    this.shared.max_requests.store(1, Ordering::Relaxed);
+                  }
+                  Some(ProtocolStatus::Overloaded | ProtocolStatus::UnknownRole) => {
+                    // The server asks not to send more requests on this
+                    // connection; it ends once the open requests have.
+                    this.send_request_rx.close();
+                    while let Ok(SentRequest { res_ch, .. }) = this.send_request_rx.try_recv() {
+                      this.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
+                      let _ = res_ch.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "FastCGI connection closed before the request was sent",
+                      )));
+                    }
+                  }
+                  _ => {}
+                }
+                if let Some(status) = status.filter(|&status| status != ProtocolStatus::RequestComplete) {
+                  if let Some(ch) = pending.res_ch.lock().unwrap().take() {
+                    let _ = ch.send(Err(std::io::Error::other(RequestRejected(status))));
+                  }
+                }
               }
             }
             _ => {
@@ -628,9 +676,17 @@ where
       }
       for request_id in cut_off {
         if let Some(pending) = this.pending.remove(&request_id) {
-          // Dropping `pending` drops the caller's response channel and
-          // closes its stdout and stderr channels without the end-of-stream
-          // sentinel, so the caller and the readers fail.
+          if let Some(ch) = pending.res_ch.lock().unwrap().take() {
+            answer(
+              ch,
+              Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the FastCGI server closed the connection before the response headers",
+              )),
+            );
+          }
+          // Dropping `pending` closes its stdout and stderr channels without
+          // the end-of-stream sentinel, so their readers fail.
           drop(pending);
           this.id_alloc.free(request_id);
           this.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -1406,9 +1462,15 @@ mod tests {
   /// A FastCGI server for tests.  Once it has read all records sent so far,
   /// it answers every request whose STDIN has ended with the request ID as
   /// the body.  It answers `FCGI_GET_VALUES` with `values`, or with
-  /// `FCGI_UNKNOWN_TYPE` if there are none.  It returns the most requests that
-  /// were open at the same time.
-  async fn serve_requests(io: tokio::io::DuplexStream, values: &[(&str, &str)]) -> usize {
+  /// `FCGI_UNKNOWN_TYPE` if there are none.  With `reject`, it ends requests
+  /// with that protocol status instead; `FCGI_CANT_MPX_CONN` only while
+  /// another request is open.  It returns the most requests that were open at
+  /// the same time.
+  async fn serve_requests(
+    io: tokio::io::DuplexStream,
+    values: &[(&str, &str)],
+    reject: Option<ProtocolStatus>,
+  ) -> usize {
     use futures_util::{FutureExt, SinkExt};
 
     let (reader, writer) = tokio::io::split(io);
@@ -1449,13 +1511,31 @@ mod tests {
       }
       max_open = max_open.max(open.len());
 
-      for request_id in answerable.drain(..) {
-        let body = format!("Content-Type: text/plain\r\n\r\n{request_id}").into_bytes();
-        for record in [
-          Record::new(RecordType::Stdout.as_u8(), request_id, body),
-          Record::new(RecordType::Stdout.as_u8(), request_id, vec![]),
-          Record::new(RecordType::EndRequest.as_u8(), request_id, vec![0, 0, 0, 0, 0, 0, 0, 0]),
-        ] {
+      // The client writes STDIN in no fixed order; answer the oldest first.
+      answerable.sort_unstable();
+      let multiplexed = open.len() > 1;
+      for (i, request_id) in answerable.drain(..).enumerate() {
+        let status = match reject {
+          Some(ProtocolStatus::CantMpxConn) if !multiplexed || i == 0 => None,
+          reject => reject,
+        };
+        let records = match status {
+          Some(status) => vec![Record::new(
+            RecordType::EndRequest.as_u8(),
+            request_id,
+            vec![0, 0, 0, 0, status.as_u8(), 0, 0, 0],
+          )],
+          None => vec![
+            Record::new(
+              RecordType::Stdout.as_u8(),
+              request_id,
+              format!("Content-Type: text/plain\r\n\r\n{request_id}").into_bytes(),
+            ),
+            Record::new(RecordType::Stdout.as_u8(), request_id, vec![]),
+            Record::new(RecordType::EndRequest.as_u8(), request_id, vec![0, 0, 0, 0, 0, 0, 0, 0]),
+          ],
+        };
+        for record in records {
           writer.send(record).await.unwrap();
         }
         open.retain(|&id| id != request_id);
@@ -1470,7 +1550,7 @@ mod tests {
   /// at the same time.
   async fn run_requests(builder: &Builder, values: &'static [(&str, &str)], requests: usize) -> (usize, usize) {
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
-    let server = tokio::spawn(serve_requests(server_io, values));
+    let server = tokio::spawn(serve_requests(server_io, values, None));
     let (send_req, connection) = builder
       .handshake::<_, http_body_util::Full<Bytes>>(client_io)
       .await
@@ -1528,6 +1608,82 @@ mod tests {
   async fn test_get_values_unknown_to_server() {
     let builder = Builder::new().get_values(true).max_requests(2).clone();
     assert_eq!(run_requests(&builder, &[], 4).await, (2, 2));
+  }
+
+  /// Sends `requests` requests at once and returns each response body or
+  /// error.
+  async fn send_requests(
+    send_req: &SendRequest<http_body_util::Full<Bytes>>,
+    requests: usize,
+  ) -> Vec<Result<Bytes, std::io::Error>> {
+    let responses = (0..requests).map(|_| async {
+      let request = http::Request::builder()
+        .method("GET")
+        .uri("http://example.com/")
+        .body(http_body_util::Full::<Bytes>::from(b"".as_ref()))
+        .unwrap();
+      let (response, _reader) = send_req.send_request(request, CgiBuilder::new()).await?;
+      Ok(response.into_body().collect().await?.to_bytes())
+    });
+    futures_util::future::join_all(responses).await
+  }
+
+  /// The protocol status a request was rejected with.
+  fn rejection(result: &Result<Bytes, std::io::Error>) -> Option<ProtocolStatus> {
+    let error = result.as_ref().err()?.get_ref()?;
+    error.downcast_ref::<RequestRejected>().map(|rejected| rejected.0)
+  }
+
+  #[tokio::test]
+  async fn test_cant_mpx_conn_limits_connection() {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let server = tokio::spawn(serve_requests(server_io, &[], Some(ProtocolStatus::CantMpxConn)));
+    let (send_req, connection) = handshake::<_, http_body_util::Full<Bytes>>(client_io, true)
+      .await
+      .unwrap();
+    let connection = tokio::spawn(connection);
+
+    // The server takes the first request and rejects the others.
+    let results = send_requests(&send_req, 3).await;
+    assert!(results[0].is_ok());
+    for result in &results[1..] {
+      assert_eq!(rejection(result), Some(ProtocolStatus::CantMpxConn));
+    }
+    assert_eq!(send_req.max_requests(), 1);
+
+    // From then on, one request at a time.
+    assert!(send_requests(&send_req, 3).await.iter().all(Result::is_ok));
+
+    drop(send_req);
+    connection.await.unwrap().unwrap();
+    server.await.unwrap();
+  }
+
+  #[tokio::test]
+  async fn test_overloaded_and_unknown_role_close_connection() {
+    for status in [ProtocolStatus::Overloaded, ProtocolStatus::UnknownRole] {
+      let (client_io, server_io) = tokio::io::duplex(1 << 16);
+      let server = tokio::spawn(serve_requests(server_io, &[], Some(status)));
+      let (send_req, connection) = Builder::new()
+        .keepalive(true)
+        .max_requests(1)
+        .handshake::<_, http_body_util::Full<Bytes>>(client_io)
+        .await
+        .unwrap();
+      let connection = tokio::spawn(connection);
+
+      // The first request is rejected; the second, still waiting, is not sent.
+      let results = send_requests(&send_req, 2).await;
+      assert_eq!(rejection(&results[0]), Some(status));
+      let error = results[1].as_ref().unwrap_err();
+      assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+      assert!(send_req.is_closed());
+      assert!(!send_req.is_ready());
+
+      // The connection ends without the handle being dropped.
+      connection.await.unwrap().unwrap();
+      server.await.unwrap();
+    }
   }
 
   #[tokio::test]
@@ -1635,6 +1791,10 @@ mod cut_off_tests {
     let (outcome, ended) = request(Vec::new(), true).await;
     let err = outcome.expect_err("no response");
     assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert_eq!(
+      err.to_string(),
+      "the FastCGI server closed the connection before the response headers"
+    );
     let err = ended.expect("the connection ends").expect_err("with an error");
     assert_eq!(
       err.to_string(),

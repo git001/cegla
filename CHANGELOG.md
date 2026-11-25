@@ -8,6 +8,7 @@
 - Fixed FastCGI client requests hanging, and their connection never ending, when the server closes the connection before it ends them: such requests now fail with `UnexpectedEof`, a response body cut off this way fails instead of ending early, and the connection resolves to an error.
 - Added `Builder` for FastCGI client connections, with a limit on the requests a connection runs at the same time (`max_requests`), and `SendRequest::is_ready` and `SendRequest::max_requests`.
 - Added `Builder::get_values`, which asks the FastCGI server for `FCGI_MAX_REQS` and `FCGI_MPXS_CONNS` during the handshake and limits the requests a connection runs at the same time to what the server supports.
+- The FastCGI client now handles the protocol status in `FCGI_END_REQUEST`: a rejected request fails with `RequestRejected`, `FCGI_CANT_MPX_CONN` limits the connection to one request at a time, and `FCGI_OVERLOADED` or `FCGI_UNKNOWN_ROLE` closes the connection to new requests.
 
 ## `cegla` 0.2.3 - April 25, 2026
 
