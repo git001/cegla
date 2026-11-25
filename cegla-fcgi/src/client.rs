@@ -4,6 +4,10 @@ use std::{
   collections::{HashMap, VecDeque},
   future::Future,
   pin::Pin,
+  sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+  },
   task::{Context, Poll},
 };
 
@@ -123,6 +127,18 @@ struct PendingRequest<B> {
 }
 
 // ---------------------------------------------------------------------------
+// Shared (state of SendRequest handles and their Connection)
+// ---------------------------------------------------------------------------
+
+/// State shared between [`SendRequest`] handles and their [`Connection`].
+struct Shared {
+  // Requests sent through SendRequest and not finished yet.
+  in_flight: AtomicUsize,
+  // The most requests the connection runs at the same time.
+  max_requests: AtomicUsize,
+}
+
+// ---------------------------------------------------------------------------
 // SentRequest (internal message from SendRequest → Connection)
 // ---------------------------------------------------------------------------
 
@@ -159,6 +175,7 @@ pin_project_lite::pin_project! {
     pending: HashMap<u16, PendingRequest<B>>,
     // ID allocator for FastCGI request IDs.
     id_alloc: IdAllocator,
+    shared: Arc<Shared>,
     // Records waiting to be flushed to the writer.
     write_queue: VecDeque<Record>,
     // A `FCGI_STDOUT` chunk waiting for room in its request's channel.  While
@@ -205,6 +222,7 @@ fn answer<T>(ch: oneshot::Sender<T>, result: T) {
 /// Represents a handle to send requests to a FastCGI server.
 pub struct SendRequest<B> {
   send_request_tx: async_channel::Sender<SentRequest<B>>,
+  shared: Arc<Shared>,
 }
 
 impl<B> SendRequest<B>
@@ -225,12 +243,15 @@ where
     std::io::Error,
   > {
     let (res_ch, res_rx) = oneshot::channel();
+    // The connection counts the request down when it's finished.
+    self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
     if self
       .send_request_tx
       .send(SentRequest { req, builder, res_ch })
       .await
       .is_err()
     {
+      self.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
       return Err(std::io::Error::new(
         std::io::ErrorKind::UnexpectedEof,
         "underlying connection closed",
@@ -244,6 +265,17 @@ where
   /// Check if the connection is closed.
   pub fn is_closed(&self) -> bool {
     self.send_request_tx.is_closed()
+  }
+
+  /// Check if the connection can run another request without waiting for
+  /// one to finish.
+  pub fn is_ready(&self) -> bool {
+    !self.is_closed() && self.shared.in_flight.load(Ordering::Relaxed) < self.max_requests()
+  }
+
+  /// The most requests the connection runs at the same time.
+  pub fn max_requests(&self) -> usize {
+    self.shared.max_requests.load(Ordering::Relaxed)
   }
 }
 
@@ -266,6 +298,11 @@ where
     // 1. Accept new requests from SendRequest handles
     // ------------------------------------------------------------------
     loop {
+      // Further requests wait until one finishes.
+      if this.pending.len() >= this.shared.max_requests.load(Ordering::Relaxed) {
+        break;
+      }
+
       match this.send_request_rx.poll_next_unpin(cx) {
         Poll::Ready(Some(SentRequest { req, builder, res_ch })) => {
           // Allocate a fresh FastCGI request ID.
@@ -273,6 +310,7 @@ where
             Some(id) => id,
             None => {
               // No IDs available – reject immediately.
+              this.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
               let _ = res_ch.send(Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "no FastCGI request IDs available",
@@ -552,9 +590,14 @@ where
         finished_ids.push(request_id);
       }
     }
+    if !finished_ids.is_empty() {
+      // Waiting requests may start now.
+      cx.waker().wake_by_ref();
+    }
     for id in finished_ids {
       this.pending.remove(&id);
       this.id_alloc.free(id);
+      this.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 
     if read_end {
@@ -573,6 +616,7 @@ where
         while let Ok(SentRequest { req, builder, res_ch }) = this.send_request_rx.try_recv() {
           // The request is never sent.
           drop((req, builder));
+          this.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
           answer(
             res_ch,
             Err(std::io::Error::new(
@@ -589,6 +633,7 @@ where
           // sentinel, so the caller and the readers fail.
           drop(pending);
           this.id_alloc.free(request_id);
+          this.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
         }
       }
       // Requests the server ended finish delivering their responses first.
@@ -636,31 +681,94 @@ impl Clone for Record {
 /// The returned [`Connection`] must be driven to completion (e.g. via
 /// `tokio::spawn`) for requests submitted through [`SendRequest`] to make
 /// progress.
+///
+/// This is [`Builder::handshake`] with only `keepalive` set.
 pub async fn handshake<Io, B>(io: Io, keepalive: bool) -> Result<(SendRequest<B>, Connection<Io, B>), std::io::Error>
 where
   Io: AsyncRead + AsyncWrite + Unpin + 'static,
   B: Body + Send + 'static,
   B::Data: AsRef<[u8]> + Send + 'static,
 {
-  let (reader, writer) = tokio::io::split(io);
-  let framed_read = FramedRead::new(reader, Decoder::default());
-  let framed_write = FramedWrite::new(writer, Encoder);
-  let (send_request_tx, send_request_rx) = async_channel::unbounded();
+  Builder::new().keepalive(keepalive).handshake(io).await
+}
 
-  Ok((
-    SendRequest { send_request_tx },
-    Connection {
-      reader: framed_read,
-      writer: framed_write,
-      keepalive,
-      send_request_rx,
-      pending: HashMap::default(),
-      id_alloc: IdAllocator::new(),
-      write_queue: VecDeque::new(),
-      stdout_send: None,
-      cut_off: 0,
-    },
-  ))
+/// Options for a FastCGI client connection.
+#[derive(Debug, Clone)]
+pub struct Builder {
+  keepalive: bool,
+  max_requests: usize,
+}
+
+impl Default for Builder {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl Builder {
+  /// Creates options with keepalive off and no limit on requests.
+  pub fn new() -> Self {
+    Self {
+      keepalive: false,
+      max_requests: usize::MAX,
+    }
+  }
+
+  /// Sets `FCGI_KEEP_CONN`, so the server keeps the connection open after a
+  /// request.
+  pub fn keepalive(&mut self, enabled: bool) -> &mut Self {
+    self.keepalive = enabled;
+    self
+  }
+
+  /// Sets the most requests the connection runs at the same time; further
+  /// requests wait until one finishes.  A server that doesn't multiplex
+  /// connections needs `1`.
+  pub fn max_requests(&mut self, max: usize) -> &mut Self {
+    self.max_requests = max.max(1);
+    self
+  }
+
+  /// Performs the FastCGI handshake and returns a handle to send requests and
+  /// a connection future.
+  ///
+  /// The returned [`Connection`] must be driven to completion (e.g. via
+  /// `tokio::spawn`) for requests submitted through [`SendRequest`] to make
+  /// progress.
+  pub async fn handshake<Io, B>(&self, io: Io) -> Result<(SendRequest<B>, Connection<Io, B>), std::io::Error>
+  where
+    Io: AsyncRead + AsyncWrite + Unpin + 'static,
+    B: Body + Send + 'static,
+    B::Data: AsRef<[u8]> + Send + 'static,
+  {
+    let (reader, writer) = tokio::io::split(io);
+    let framed_read = FramedRead::new(reader, Decoder::default());
+    let framed_write = FramedWrite::new(writer, Encoder);
+    let (send_request_tx, send_request_rx) = async_channel::unbounded();
+    let shared = Arc::new(Shared {
+      in_flight: AtomicUsize::new(0),
+      max_requests: AtomicUsize::new(self.max_requests),
+    });
+
+    Ok((
+      SendRequest {
+        send_request_tx,
+        shared: Arc::clone(&shared),
+      },
+      Connection {
+        reader: framed_read,
+        writer: framed_write,
+        keepalive: self.keepalive,
+        send_request_rx,
+        pending: HashMap::default(),
+        id_alloc: IdAllocator::new(),
+        shared,
+        write_queue: VecDeque::new(),
+        stdout_send: None,
+        cut_off: 0,
+      },
+    ))
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -749,6 +857,10 @@ mod tests {
       send_request_rx,
       pending: HashMap::default(),
       id_alloc: IdAllocator::new(),
+      shared: Arc::new(Shared {
+        in_flight: AtomicUsize::new(0),
+        max_requests: AtomicUsize::new(usize::MAX),
+      }),
       write_queue: VecDeque::new(),
       stdout_send: None,
       cut_off: 0,
@@ -1200,6 +1312,114 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(stderr.len(), 200 * 100);
+
+    drop(connection_task);
+  }
+
+  /// A FastCGI server for tests.  Once it has read all records sent so far,
+  /// it answers every request whose STDIN has ended with the request ID as
+  /// the body.  It returns the most requests that were open at the same time.
+  async fn serve_requests(io: tokio::io::DuplexStream) -> usize {
+    use futures_util::{FutureExt, SinkExt};
+
+    let (reader, writer) = tokio::io::split(io);
+    let mut reader = FramedRead::new(reader, Decoder::default());
+    let mut writer = FramedWrite::new(writer, Encoder);
+    let mut open: Vec<u16> = Vec::new();
+    let mut answerable: Vec<u16> = Vec::new();
+    let mut max_open = 0;
+
+    while let Some(record) = reader.next().await {
+      let mut records = vec![record.unwrap()];
+      while let Some(Some(record)) = reader.next().now_or_never() {
+        records.push(record.unwrap());
+      }
+      for record in records {
+        match RecordType::from_u8(record.record_type) {
+          Some(RecordType::BeginRequest) => open.push(record.request_id),
+          Some(RecordType::Stdin) if record.content.is_empty() => answerable.push(record.request_id),
+          _ => {}
+        }
+      }
+      max_open = max_open.max(open.len());
+
+      for request_id in answerable.drain(..) {
+        let body = format!("Content-Type: text/plain\r\n\r\n{request_id}").into_bytes();
+        for record in [
+          Record::new(RecordType::Stdout.as_u8(), request_id, body),
+          Record::new(RecordType::Stdout.as_u8(), request_id, vec![]),
+          Record::new(RecordType::EndRequest.as_u8(), request_id, vec![0, 0, 0, 0, 0, 0, 0, 0]),
+        ] {
+          writer.send(record).await.unwrap();
+        }
+        open.retain(|&id| id != request_id);
+      }
+    }
+    max_open
+  }
+
+  /// Sends `requests` requests at once through a connection made by
+  /// `builder`, and returns the most the server saw open at the same time.
+  async fn run_requests(builder: &Builder, requests: usize) -> usize {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let server = tokio::spawn(serve_requests(server_io));
+    let (send_req, connection) = builder
+      .handshake::<_, http_body_util::Full<Bytes>>(client_io)
+      .await
+      .unwrap();
+    let connection = tokio::spawn(connection);
+
+    let responses = (0..requests).map(|_| async {
+      let request = http::Request::builder()
+        .method("GET")
+        .uri("http://example.com/")
+        .body(http_body_util::Full::<Bytes>::from(b"".as_ref()))
+        .unwrap();
+      let (response, _reader) = send_req.send_request(request, CgiBuilder::new()).await.unwrap();
+      response.into_body().collect().await.unwrap().to_bytes()
+    });
+    for body in futures_util::future::join_all(responses).await {
+      assert!(!body.is_empty());
+    }
+
+    drop(send_req);
+    connection.await.unwrap().unwrap();
+    server.await.unwrap()
+  }
+
+  #[tokio::test]
+  async fn test_requests_run_at_once_without_limit() {
+    assert_eq!(run_requests(&Builder::new(), 3).await, 3);
+  }
+
+  #[tokio::test]
+  async fn test_max_requests_limits_open_requests() {
+    assert_eq!(run_requests(Builder::new().max_requests(2), 5).await, 2);
+    assert_eq!(run_requests(Builder::new().max_requests(1), 3).await, 1);
+  }
+
+  #[tokio::test]
+  async fn test_is_ready_with_max_requests() {
+    use futures_util::FutureExt;
+
+    let (client_io, _server_io) = tokio::io::duplex(1 << 16);
+    let (send_req, connection) = Builder::new()
+      .max_requests(1)
+      .handshake::<_, http_body_util::Full<Bytes>>(client_io)
+      .await
+      .unwrap();
+    let connection_task = tokio::spawn(connection);
+    assert_eq!(send_req.max_requests(), 1);
+    assert!(send_req.is_ready());
+
+    let request = http::Request::builder()
+      .method("GET")
+      .uri("http://example.com/")
+      .body(http_body_util::Full::<Bytes>::from(b"".as_ref()))
+      .unwrap();
+    let mut response = Box::pin(send_req.send_request(request, CgiBuilder::new()));
+    assert!((&mut response).now_or_never().is_none());
+    assert!(!send_req.is_ready());
 
     drop(connection_task);
   }

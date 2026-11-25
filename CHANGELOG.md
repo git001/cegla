@@ -6,6 +6,7 @@
 - Fixed FastCGI client dropping response data when the server sends more than 64 STDOUT records before they are read.
 - Fixed FastCGI client dropping error output when the server sends more than 64 STDERR records before they are read.
 - Fixed FastCGI client requests hanging, and their connection never ending, when the server closes the connection before it ends them: such requests now fail with `UnexpectedEof`, a response body cut off this way fails instead of ending early, and the connection resolves to an error.
+- Added `Builder` for FastCGI client connections, with a limit on the requests a connection runs at the same time (`max_requests`), and `SendRequest::is_ready` and `SendRequest::max_requests`.
 
 ## `cegla` 0.2.3 - April 25, 2026
 
