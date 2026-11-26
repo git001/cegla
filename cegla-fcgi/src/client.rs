@@ -171,6 +171,31 @@ impl std::fmt::Display for RequestRejected {
 
 impl std::error::Error for RequestRejected {}
 
+/// The request body failed while the connection sent it, so the FastCGI
+/// server got only part of it; the inner error is the body's.
+///
+/// The request isn't finished as if the body were whole: on a connection
+/// that multiplexes, the server gets `FCGI_ABORT_REQUEST`; otherwise the
+/// connection ends with an error, as only that tells such a server, php-fpm
+/// say, that the body was cut off.
+///
+/// [`SendRequest::send_request`] returns it inside a [`std::io::Error`]; get
+/// it with [`std::io::Error::get_ref`] and `downcast_ref`.
+#[derive(Debug)]
+pub struct RequestBodyFailed(pub Box<dyn std::error::Error + Send + Sync>);
+
+impl std::fmt::Display for RequestBodyFailed {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "the request body failed: {}", self.0)
+  }
+}
+
+impl std::error::Error for RequestBodyFailed {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    Some(self.0.as_ref())
+  }
+}
+
 /// The connection never sent the request to the FastCGI server, so sending
 /// it again on another connection is safe, even if it isn't idempotent.
 ///
@@ -598,6 +623,7 @@ where
   Io: AsyncRead + AsyncWrite + Unpin + 'static,
   B: Body + Send + 'static,
   B::Data: AsRef<[u8]> + Send + 'static,
+  B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
   type Output = Result<Closed, std::io::Error>;
 
@@ -763,9 +789,12 @@ where
     // ------------------------------------------------------------------
     // 2. Drain STDIN from pending requests that still have a body
     // ------------------------------------------------------------------
+    // A body failed on a connection that can't abort its request.
+    let mut cant_abort = false;
     for (&request_id, pending) in this.pending.iter_mut() {
       if let Some(ref mut body) = pending.body {
         let mut body_done = false;
+        let mut failed = None;
         loop {
           match body.as_mut().poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
@@ -780,10 +809,9 @@ where
                 }
               }
             }
-            Poll::Ready(Some(Err(_))) => {
-              this
-                .write_queue
-                .push_back(Record::new(RecordType::Stdin.as_u8(), request_id, Vec::new()));
+            Poll::Ready(Some(Err(err))) => {
+              failed = Some(err.into());
+              break;
             }
             Poll::Ready(None) => {
               body_done = true;
@@ -791,6 +819,33 @@ where
             }
             Poll::Pending => break,
           }
+        }
+        if let Some(err) = failed {
+          // STDIN doesn't end: the server must not take the body as whole.
+          pending.body = None;
+          // Nor may a response that has started look whole: its reader
+          // fails. Closed, the stdout channel also makes step 5 abort the
+          // request on a connection that multiplexes.
+          if pending.stdout_tx.close() {
+            // Closed now.
+          } else {
+            // Its reader was gone already.
+          }
+          let caller = match pending.res_ch.lock() {
+            Ok(mut res_ch) => res_ch.take(),
+            // A response future panicked while it held the lock; the
+            // channel is still whole.
+            Err(poisoned) => poisoned.into_inner().take(),
+          };
+          match caller {
+            Some(ch) => answer(ch, Err(std::io::Error::other(RequestBodyFailed(err)))),
+            // The response came already; its body fails instead.
+            None => drop(err),
+          }
+          if !this.shared.multiplexes.load(Ordering::Relaxed) {
+            cant_abort = true;
+          }
+          continue;
         }
         if body_done {
           // Empty STDIN record terminates the stdin stream.
@@ -800,6 +855,13 @@ where
           pending.body = None;
         }
       }
+    }
+    if cant_abort {
+      // Requests waiting for this connection go elsewhere.
+      refuse_waiting(this.send_request_rx.as_ref().get_ref(), this.shared);
+      return Poll::Ready(Err(std::io::Error::other(
+        "a request body failed on a FastCGI connection that can't abort the request",
+      )));
     }
 
     // ------------------------------------------------------------------
@@ -2932,41 +2994,131 @@ mod known_issue_tests {
     drop(server_io);
   }
 
-  /// Right: a request body that fails is not passed on as whole: the request
-  /// is aborted or its connection closed, and the error is reported.
-  /// Today: the error is dropped and STDIN ends as if the body were whole;
-  /// the end of the body then ends STDIN a second time.
+  /// A body that fails after "part".
+  fn failing_body() -> Streamed {
+    let frames: Vec<Result<Frame<Bytes>, std::io::Error>> = vec![
+      Ok(Frame::data(Bytes::from_static(b"part"))),
+      Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+    ];
+    BoxBody::new(StreamBody::new(futures_util::stream::iter(frames)))
+  }
+
+  /// Whether `result` failed with the body's error inside
+  /// [`RequestBodyFailed`].
+  fn body_failed(result: &ResponseResult) -> bool {
+    match result {
+      Ok((response, stderr)) => panic!("no response comes: {:?} {}", response.status(), stderr.ended),
+      Err(err) => match err
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<RequestBodyFailed>())
+      {
+        Some(failed) => match failed.0.downcast_ref::<std::io::Error>() {
+          Some(source) => source.kind() == std::io::ErrorKind::ConnectionReset,
+          None => panic!("the body's own error is inside: {failed}"),
+        },
+        None => panic!("the body failed, not: {err}"),
+      },
+    }
+  }
+
+  /// A body that fails ends the connection, on a server that doesn't
+  /// multiplex: php-fpm learns of it only so. STDIN doesn't end, and the
+  /// caller gets the body's error.
+  /// Before: STDIN ended as if the body were whole, and then a second time.
   #[tokio::test]
-  async fn known_issue_a_failed_request_body_reaches_the_server_as_whole() {
+  async fn a_failed_request_body_ends_a_connection_that_cant_abort() {
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     let (send_req, connection) = handshake::<tokio::io::DuplexStream, Streamed>(client_io, true)
       .await
       .unwrap();
     let driver = tokio::spawn(connection);
-    let frames: Vec<Result<Frame<Bytes>, std::io::Error>> = vec![
-      Ok(Frame::data(Bytes::from_static(b"part"))),
-      Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
-    ];
-    let body = BoxBody::new(StreamBody::new(futures_util::stream::iter(frames)));
-    let sending = tokio::spawn(async move { send_req.send_request(request(body), CgiBuilder::new()).await });
+    let sending = tokio::spawn(async move {
+      let result = send_req.send_request(request(failing_body()), CgiBuilder::new()).await;
+      (result, send_req)
+    });
     let (server_read, server_write) = tokio::io::split(server_io);
     let mut server = FramedRead::new(server_read, Decoder::default());
 
-    let (request_id, stdin) = read_request(&mut server).await;
-    assert_eq!(stdin, b"part", "known issue: the cut-off body ends like a whole one");
-    yield_rounds(100).await;
-    let mut more = Vec::new();
-    while let Some(Some(record)) = futures_util::FutureExt::now_or_never(server.next()) {
-      let record = record.expect("a valid record");
-      more.push((record.record_type, record.request_id, record.content));
+    assert!(settles(&driver).await, "the connection ends");
+    match driver.await.unwrap() {
+      Ok(closed) => panic!("the connection ends with an error, not {closed:?}"),
+      Err(err) => assert!(err.to_string().contains("can't abort"), "{err}"),
     }
-    assert_eq!(
-      more,
-      [(RecordType::Stdin.as_u8(), request_id, Vec::new())],
-      "known issue: STDIN ends a second time, and nothing aborts the request"
-    );
-    sending.abort();
-    driver.abort();
+    let (result, send_req) = sending.await.unwrap();
+    assert!(body_failed(&result));
+    assert!(send_req.is_closed());
+    assert_eq!(send_req.idle().await, Settled::Ended);
+
+    let mut stdin = Vec::new();
+    while let Some(record) = server.next().await {
+      let record = record.expect("a valid record");
+      if record.record_type == RecordType::Stdin.as_u8() {
+        assert!(!record.content.is_empty(), "STDIN doesn't end");
+        stdin.extend_from_slice(&record.content);
+      }
+      assert_ne!(
+        record.record_type,
+        RecordType::AbortRequest.as_u8(),
+        "php-fpm doesn't know it"
+      );
+    }
+    // The connection may end before it has written what it had queued.
+    assert!(b"part".starts_with(&stdin), "{stdin:?}");
     drop(server_write);
+  }
+
+  /// A body that fails aborts its request on a server that multiplexes; the
+  /// connection runs on, and the request's place is free once the server
+  /// has ended it.
+  #[tokio::test]
+  async fn a_failed_request_body_aborts_its_request_on_a_multiplexed_connection() {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let (server_read, server_write) = tokio::io::split(server_io);
+    let mut server = FramedRead::new(server_read, Decoder::default());
+    let mut server_out = FramedWrite::new(server_write, Encoder);
+    let backend = tokio::spawn(async move {
+      let get_values = server.next().await.expect("a record").expect("a valid record");
+      assert_eq!(get_values.record_type, RecordType::GetValues.as_u8());
+      let values = NameValuePair::from_slices(b"FCGI_MPXS_CONNS", b"1").encode().to_vec();
+      server_out
+        .send(Record::new(RecordType::GetValuesResult.as_u8(), 0, values))
+        .await
+        .unwrap();
+      let mut stdin = Vec::new();
+      loop {
+        let record = server.next().await.expect("a record").expect("a valid record");
+        if record.record_type == RecordType::Stdin.as_u8() {
+          assert!(!record.content.is_empty(), "STDIN doesn't end");
+          stdin.extend_from_slice(&record.content);
+        }
+        if record.record_type == RecordType::AbortRequest.as_u8() {
+          return (record.request_id, stdin, server, server_out);
+        }
+      }
+    });
+    let builder = Builder::new().keepalive(true).get_values(true).clone();
+    let (send_req, connection) = builder
+      .handshake::<tokio::io::DuplexStream, Streamed>(client_io)
+      .await
+      .unwrap();
+    let driver = tokio::spawn(connection);
+    let result = send_req.send_request(request(failing_body()), CgiBuilder::new()).await;
+    assert!(body_failed(&result));
+
+    assert!(settles(&backend).await, "the server gets FCGI_ABORT_REQUEST");
+    let (request_id, stdin, server, mut server_out) = backend.await.unwrap();
+    assert_eq!(stdin, b"part");
+    assert!(!driver.is_finished(), "the connection runs on");
+    assert!(!send_req.is_closed());
+    server_out
+      .send(Record::new(RecordType::EndRequest.as_u8(), request_id, vec![0; 8]))
+      .await
+      .unwrap();
+    assert!(
+      comes_true(|| send_req.in_flight() == 0).await,
+      "the ended request gives up its place"
+    );
+    driver.abort();
+    drop((server, server_out));
   }
 }
