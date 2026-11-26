@@ -9,7 +9,7 @@ use std::{
     Arc,
   },
   task::{Context, Poll},
-  time::Instant,
+  time::{Duration, Instant},
 };
 
 use cegla::{client::convert_to_http_response, CgiIncoming};
@@ -135,8 +135,8 @@ struct PendingRequest<B> {
   end_received: bool,
   // Whether the empty `FCGI_STDOUT` record has been received.
   stdout_ended: bool,
-  // Whether `FCGI_ABORT_REQUEST` has been sent.
-  aborted: bool,
+  // When `FCGI_ABORT_REQUEST` was sent, if it was.
+  aborted: Option<Instant>,
   // Futures that convert the accumulated stdout into an HTTP response and
   // deliver it through the oneshot channel.
   response_futures: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
@@ -170,6 +170,51 @@ impl std::fmt::Display for RequestRejected {
 }
 
 impl std::error::Error for RequestRejected {}
+
+/// Sleeps for the timeouts a [`Connection`] keeps, from whichever async
+/// runtime drives it.
+pub trait Timer: Send + Sync {
+  /// A future that completes once `duration` has passed.
+  fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+}
+
+/// How long the server may take to end a request after
+/// `FCGI_ABORT_REQUEST`, and what to sleep with.
+#[derive(Clone)]
+struct AbortTimeout {
+  after: Duration,
+  timer: Arc<dyn Timer>,
+}
+
+impl std::fmt::Debug for AbortTimeout {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("AbortTimeout")
+      .field("after", &self.after)
+      .finish_non_exhaustive()
+  }
+}
+
+/// The server didn't end a request within [`Builder::abort_timeout`] of
+/// `FCGI_ABORT_REQUEST`, so the connection ended: the request would
+/// otherwise have kept its place on it for good.
+///
+/// The [`Connection`] ends with it inside a [`std::io::Error`] of kind
+/// [`std::io::ErrorKind::TimedOut`]; get it with
+/// [`std::io::Error::get_ref`] and `downcast_ref`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AbortUnanswered(pub Duration);
+
+impl std::fmt::Display for AbortUnanswered {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "the FastCGI server didn't end an aborted request within {:?}",
+      self.0
+    )
+  }
+}
+
+impl std::error::Error for AbortUnanswered {}
 
 /// The request body failed while the connection sent it, so the FastCGI
 /// server got only part of it; the inner error is the body's.
@@ -354,6 +399,10 @@ pin_project_lite::pin_project! {
     stdout_send: Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
     // Requests that were running when the server closed the connection.
     cut_off: usize,
+    // How long an aborted request may take to end, if limited.
+    abort_timeout: Option<AbortTimeout>,
+    // Wakes the connection when the oldest unanswered abort is due.
+    abort_sleep: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     ended: EndGuard,
   }
 }
@@ -769,7 +818,7 @@ where
               stderr_tx,
               end_received: false,
               stdout_ended: false,
-              aborted: false,
+              aborted: None,
               response_futures,
               res_ch,
             },
@@ -983,12 +1032,12 @@ where
       // The response was dropped before it ended, or the caller stopped
       // waiting for its headers: the server can stop.
       if this.shared.multiplexes.load(Ordering::Relaxed)
-        && !pending.aborted
+        && pending.aborted.is_none()
         && !pending.stdout_ended
         && !pending.end_received
         && (pending.stdout_tx.is_closed() || headers_abandoned(&pending.res_ch))
       {
-        pending.aborted = true;
+        pending.aborted = Some(Instant::now());
         pending.body = None;
         this
           .write_queue
@@ -1011,6 +1060,53 @@ where
       this.pending.remove(&id);
       this.id_alloc.free(id);
       this.shared.finish_request();
+    }
+
+    // ------------------------------------------------------------------
+    // 6. End the connection if the server doesn't answer an abort
+    // ------------------------------------------------------------------
+    if let Some(abort_timeout) = this.abort_timeout.as_ref() {
+      // The oldest abort the server hasn't answered.
+      let mut oldest: Option<Instant> = None;
+      for pending in this.pending.values() {
+        if pending.end_received {
+          // Answered: it finishes once its response has been delivered,
+          // which can wait for room in a full stdout channel when the
+          // caller left before the headers. Rare, so no test covers it.
+          continue;
+        }
+        if let Some(at) = pending.aborted {
+          oldest = Some(match oldest {
+            Some(older) => older.min(at),
+            None => at,
+          });
+        }
+      }
+      match oldest {
+        None => *this.abort_sleep = None,
+        Some(at) => {
+          let waited = at.elapsed();
+          if waited >= abort_timeout.after {
+            // Requests waiting for this connection go elsewhere.
+            refuse_waiting(this.send_request_rx.as_ref().get_ref(), this.shared);
+            return Poll::Ready(Err(std::io::Error::new(
+              std::io::ErrorKind::TimedOut,
+              AbortUnanswered(abort_timeout.after),
+            )));
+          }
+          let sleep = this
+            .abort_sleep
+            .get_or_insert_with(|| abort_timeout.timer.sleep(abort_timeout.after - waited));
+          match sleep.as_mut().poll(cx) {
+            Poll::Ready(()) => {
+              // Due: look again.
+              *this.abort_sleep = None;
+              cx.waker().wake_by_ref();
+            }
+            Poll::Pending => {}
+          }
+        }
+      }
     }
 
     if read_end {
@@ -1164,6 +1260,7 @@ pub struct Builder {
   keepalive: bool,
   max_requests: usize,
   get_values: bool,
+  abort_timeout: Option<AbortTimeout>,
 }
 
 impl Default for Builder {
@@ -1179,6 +1276,7 @@ impl Builder {
       keepalive: false,
       max_requests: usize::MAX,
       get_values: false,
+      abort_timeout: None,
     }
   }
 
@@ -1207,6 +1305,17 @@ impl Builder {
   /// The handshake then waits for the answer, so wrap it in a timeout.
   pub fn get_values(&mut self, enabled: bool) -> &mut Self {
     self.get_values = enabled;
+    self
+  }
+
+  /// Ends the connection with [`AbortUnanswered`] when the server doesn't
+  /// end a request within `after` of `FCGI_ABORT_REQUEST`; otherwise such a
+  /// request keeps its place on the connection, and the connection never
+  /// becomes idle. `timer` gives the connection its sleeps. Off by default.
+  ///
+  /// Only a server that multiplexes connections gets `FCGI_ABORT_REQUEST`.
+  pub fn abort_timeout(&mut self, after: Duration, timer: Arc<dyn Timer>) -> &mut Self {
+    self.abort_timeout = Some(AbortTimeout { after, timer });
     self
   }
 
@@ -1261,6 +1370,8 @@ impl Builder {
         write_queue: VecDeque::new(),
         stdout_send: None,
         cut_off: 0,
+        abort_timeout: self.abort_timeout.clone(),
+        abort_sleep: None,
       },
     ))
   }
@@ -1358,6 +1469,8 @@ mod tests {
       write_queue: VecDeque::new(),
       stdout_send: None,
       cut_off: 0,
+      abort_timeout: None,
+      abort_sleep: None,
     };
 
     // Test that we can create a connection
@@ -2892,12 +3005,45 @@ mod known_issue_tests {
     driver.abort();
   }
 
-  /// Right: a request whose `FCGI_ABORT_REQUEST` the server never answers
-  /// gives up its place after a while, or its connection ends.
-  /// Today: it keeps its place as long as the connection is open; no timer
-  /// runs for it.
-  #[tokio::test]
-  async fn known_issue_an_unanswered_abort_keeps_its_place() {
+  /// Sleeps on a thread of its own: the tests' runtime has no timer.
+  struct ThreadTimer;
+
+  impl Timer for ThreadTimer {
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+      let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+      std::thread::spawn(move || {
+        std::thread::sleep(duration);
+        if let Err(()) = done_tx.send(()) {
+          // The connection stopped waiting: there is nothing to wake.
+        }
+      });
+      Box::pin(async move {
+        match done_rx.await {
+          Ok(()) => {}
+          Err(gone) => panic!("the timer's thread ended: {gone}"),
+        }
+      })
+    }
+  }
+
+  async fn wait(duration: Duration) {
+    ThreadTimer.sleep(duration).await;
+  }
+
+  type ServerOut = FramedWrite<WriteHalf<tokio::io::DuplexStream>, Encoder>;
+
+  /// A connection made by `builder` to a server that multiplexes, with a
+  /// request whose response was dropped: the server got
+  /// `FCGI_ABORT_REQUEST` for it and hasn't answered.
+  async fn an_unanswered_abort(
+    builder: &Builder,
+  ) -> (
+    SendRequest<Full<Bytes>>,
+    tokio::task::JoinHandle<Result<Closed, std::io::Error>>,
+    u16,
+    Server,
+    ServerOut,
+  ) {
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     let (server_read, server_write) = tokio::io::split(server_io);
     let mut server = FramedRead::new(server_read, Decoder::default());
@@ -2925,7 +3071,6 @@ mod known_issue_tests {
         }
       }
     });
-    let builder = Builder::new().keepalive(true).get_values(true).clone();
     let (send_req, connection) = builder
       .handshake::<tokio::io::DuplexStream, Full<Bytes>>(client_io)
       .await
@@ -2938,14 +3083,20 @@ mod known_issue_tests {
     drop((response, stderr));
 
     assert!(settles(&backend).await, "the server gets FCGI_ABORT_REQUEST");
-    let (request_id, server, mut server_out) = backend.await.unwrap();
+    let (request_id, server, server_out) = backend.await.unwrap();
+    (send_req, driver, request_id, server, server_out)
+  }
+
+  /// Without an abort timeout, a request whose `FCGI_ABORT_REQUEST` the
+  /// server never answers keeps its place as long as the connection is
+  /// open.
+  #[tokio::test]
+  async fn without_an_abort_timeout_an_unanswered_abort_keeps_its_place() {
+    let builder = Builder::new().keepalive(true).get_values(true).clone();
+    let (send_req, driver, request_id, server, mut server_out) = an_unanswered_abort(&builder).await;
     yield_rounds(2000).await;
     assert!(!driver.is_finished(), "the connection runs on");
-    assert_eq!(
-      send_req.in_flight(),
-      1,
-      "known issue: the aborted request keeps its place"
-    );
+    assert_eq!(send_req.in_flight(), 1, "the aborted request keeps its place");
 
     // Counter-check: the place is free once the server ends the request.
     server_out
@@ -2956,6 +3107,60 @@ mod known_issue_tests {
       comes_true(|| send_req.in_flight() == 0).await,
       "the ended request gives up its place"
     );
+    driver.abort();
+    drop((server, server_out));
+  }
+
+  /// With an abort timeout, the connection ends once the server hasn't
+  /// answered an abort for that long, and not before.
+  #[tokio::test]
+  async fn an_unanswered_abort_ends_the_connection_after_the_abort_timeout() {
+    let after = Duration::from_millis(100);
+    let builder = Builder::new()
+      .keepalive(true)
+      .get_values(true)
+      .abort_timeout(after, Arc::new(ThreadTimer))
+      .clone();
+    let (send_req, driver, request_id, server, server_out) = an_unanswered_abort(&builder).await;
+    wait(Duration::from_millis(30)).await;
+    assert!(!driver.is_finished(), "not yet: the server may still end the request");
+    wait(Duration::from_millis(200)).await;
+    assert!(driver.is_finished(), "the abort timeout ended the connection");
+    match driver.await.unwrap() {
+      Ok(closed) => panic!("the connection ends with an error, not {closed:?}"),
+      Err(err) => {
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+          err.get_ref().and_then(|inner| inner.downcast_ref::<AbortUnanswered>()),
+          Some(&AbortUnanswered(after))
+        );
+      }
+    }
+    assert!(send_req.is_closed(), "the connection takes no more requests");
+    assert_eq!(send_req.idle().await, Settled::Ended);
+    drop((request_id, server, server_out));
+  }
+
+  /// An abort the server answers in time doesn't end the connection.
+  #[tokio::test]
+  async fn an_answered_abort_keeps_the_connection() {
+    let builder = Builder::new()
+      .keepalive(true)
+      .get_values(true)
+      .abort_timeout(Duration::from_millis(100), Arc::new(ThreadTimer))
+      .clone();
+    let (send_req, driver, request_id, server, mut server_out) = an_unanswered_abort(&builder).await;
+    server_out
+      .send(Record::new(RecordType::EndRequest.as_u8(), request_id, vec![0; 8]))
+      .await
+      .unwrap();
+    assert!(
+      comes_true(|| send_req.in_flight() == 0).await,
+      "the ended request gives up its place"
+    );
+    wait(Duration::from_millis(250)).await;
+    assert!(!driver.is_finished(), "the connection runs on");
+    assert!(!send_req.is_closed());
     driver.abort();
     drop((server, server_out));
   }
