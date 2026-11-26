@@ -186,6 +186,51 @@ struct Shared {
   // Only such a server is sure to take FCGI_ABORT_REQUEST: php-fpm reads it
   // as the start of the next request and closes a kept-alive connection.
   multiplexes: AtomicBool,
+  // Wakes SendRequest::idle when in_flight drops to 0 or the connection ends.
+  settled: tokio::sync::Notify,
+  // Whether the Connection is gone.
+  ended: AtomicBool,
+}
+
+impl Shared {
+  fn new(max_requests: usize, multiplexes: bool) -> Self {
+    Self {
+      in_flight: AtomicUsize::new(0),
+      max_requests: AtomicUsize::new(max_requests),
+      waker: AtomicWaker::new(),
+      multiplexes: AtomicBool::new(multiplexes),
+      settled: tokio::sync::Notify::new(),
+      ended: AtomicBool::new(false),
+    }
+  }
+
+  /// Counts a finished request down, and wakes those waiting for the
+  /// connection to be idle if it was the last one.
+  fn finish_request(&self) {
+    if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+      self.settled.notify_waiters();
+    }
+  }
+}
+
+/// Marks the connection as ended when its [`Connection`] is dropped, so
+/// [`SendRequest::idle`] doesn't wait for requests that will never finish.
+struct EndGuard(Arc<Shared>);
+
+impl Drop for EndGuard {
+  fn drop(&mut self) {
+    self.0.ended.store(true, Ordering::Release);
+    self.0.settled.notify_waiters();
+  }
+}
+
+/// What [`SendRequest::idle`] waited for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Settled {
+  /// No request runs on the connection any more.
+  Idle,
+  /// The connection has ended; requests it still counted will never finish.
+  Ended,
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +270,7 @@ pin_project_lite::pin_project! {
     stdout_send: Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
     // Requests that were running when the server closed the connection.
     cut_off: usize,
+    ended: EndGuard,
   }
 }
 
@@ -305,7 +351,7 @@ where
       .await
       .is_err()
     {
-      self.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
+      self.shared.finish_request();
       return Err(std::io::Error::new(
         std::io::ErrorKind::UnexpectedEof,
         "underlying connection closed",
@@ -320,6 +366,25 @@ where
   /// sent and waiting for room.  `0` means the connection is idle.
   pub fn in_flight(&self) -> usize {
     self.shared.in_flight.load(Ordering::Relaxed)
+  }
+
+  /// Waits until no request runs on the connection any more, or the
+  /// connection has ended.
+  pub async fn idle(&self) -> Settled {
+    loop {
+      let mut settled = std::pin::pin!(self.shared.settled.notified());
+      // Register before looking, so a change in between isn't missed.
+      let changed = settled.as_mut().enable();
+      if self.shared.ended.load(Ordering::Acquire) {
+        return Settled::Ended;
+      }
+      if self.shared.in_flight.load(Ordering::Acquire) == 0 {
+        return Settled::Idle;
+      }
+      if !changed {
+        settled.await;
+      }
+    }
   }
 
   /// Check if the connection is closed.
@@ -381,7 +446,7 @@ where
             Some(id) => id,
             None => {
               // No IDs available – reject immediately.
-              this.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
+              this.shared.finish_request();
               let _ = res_ch.send(Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "no FastCGI request IDs available",
@@ -648,7 +713,7 @@ where
                     // connection; it ends once the open requests have.
                     this.send_request_rx.close();
                     while let Ok(SentRequest { res_ch, .. }) = this.send_request_rx.try_recv() {
-                      this.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
+                      this.shared.finish_request();
                       let _ = res_ch.send(Err(std::io::Error::new(
                         std::io::ErrorKind::ConnectionAborted,
                         "FastCGI connection closed before the request was sent",
@@ -716,7 +781,7 @@ where
     for id in finished_ids {
       this.pending.remove(&id);
       this.id_alloc.free(id);
-      this.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
+      this.shared.finish_request();
     }
 
     if read_end {
@@ -735,7 +800,7 @@ where
         while let Ok(SentRequest { req, builder, res_ch }) = this.send_request_rx.try_recv() {
           // The request is never sent.
           drop((req, builder));
-          this.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
+          this.shared.finish_request();
           answer(
             res_ch,
             Err(std::io::Error::new(
@@ -760,7 +825,7 @@ where
           // the end-of-stream sentinel, so their readers fail.
           drop(pending);
           this.id_alloc.free(request_id);
-          this.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
+          this.shared.finish_request();
         }
       }
       // Requests the server ended finish delivering their responses first.
@@ -960,12 +1025,7 @@ impl Builder {
       ServerValues { .. } => self.max_requests,
     };
     let (send_request_tx, send_request_rx) = async_channel::unbounded();
-    let shared = Arc::new(Shared {
-      in_flight: AtomicUsize::new(0),
-      max_requests: AtomicUsize::new(max_requests),
-      waker: AtomicWaker::new(),
-      multiplexes: AtomicBool::new(values.multiplexes == Some(true)),
-    });
+    let shared = Arc::new(Shared::new(max_requests, values.multiplexes == Some(true)));
 
     Ok((
       SendRequest {
@@ -979,6 +1039,7 @@ impl Builder {
         send_request_rx,
         pending: HashMap::default(),
         id_alloc: IdAllocator::new(),
+        ended: EndGuard(Arc::clone(&shared)),
         shared,
         write_queue: VecDeque::new(),
         stdout_send: None,
@@ -1067,6 +1128,7 @@ mod tests {
     let framed_write = FramedWrite::new(writer, Encoder);
     let (_send_request_tx, send_request_rx) = async_channel::unbounded::<SentRequest<http_body_util::Full<Bytes>>>();
 
+    let shared = Arc::new(Shared::new(usize::MAX, false));
     let connection = Connection {
       reader: framed_read,
       writer: framed_write,
@@ -1074,12 +1136,8 @@ mod tests {
       send_request_rx,
       pending: HashMap::default(),
       id_alloc: IdAllocator::new(),
-      shared: Arc::new(Shared {
-        in_flight: AtomicUsize::new(0),
-        max_requests: AtomicUsize::new(usize::MAX),
-        waker: AtomicWaker::new(),
-        multiplexes: AtomicBool::new(false),
-      }),
+      ended: EndGuard(Arc::clone(&shared)),
+      shared,
       write_queue: VecDeque::new(),
       stdout_send: None,
       cut_off: 0,
@@ -2136,5 +2194,87 @@ mod cut_off_tests {
     drop(send_req);
     assert!(settles(&driver).await, "the connection ends without handles");
     assert_eq!(driver.await.unwrap().expect("without an error"), Closed::ByClient);
+  }
+
+  /// A request that the server has read, on a connection whose driver runs;
+  /// the server end of the connection, and the response it waits for.
+  async fn running_request() -> (
+    SendRequest<http_body_util::Full<Bytes>>,
+    tokio::task::JoinHandle<std::io::Result<Closed>>,
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<Result<Bytes, std::io::Error>>,
+  ) {
+    let (client_io, mut server_io) = tokio::io::duplex(65536);
+    let (send_req, connection) = handshake::<tokio::io::DuplexStream, http_body_util::Full<Bytes>>(client_io, true)
+      .await
+      .unwrap();
+    let driver = tokio::spawn(connection);
+    let sender = send_req.clone();
+    let response = tokio::spawn(async move {
+      let req = http::Request::builder()
+        .uri("http://backend/")
+        .body(http_body_util::Full::<Bytes>::from(""))
+        .unwrap();
+      let (response, stderr) = sender.send_request(req, CgiBuilder::new()).await?;
+      drop(stderr);
+      let body = response.into_body().collect().await?;
+      Ok::<Bytes, std::io::Error>(body.to_bytes())
+    });
+    let mut request = vec![0u8; 4096];
+    let read = server_io.read(&mut request).await.unwrap();
+    assert!(read > 0, "the request arrives");
+    (send_req, driver, server_io, response)
+  }
+
+  #[tokio::test]
+  async fn a_new_connection_is_idle() {
+    let (client_io, server_io) = tokio::io::duplex(65536);
+    let (send_req, connection) = handshake::<tokio::io::DuplexStream, http_body_util::Full<Bytes>>(client_io, true)
+      .await
+      .unwrap();
+    assert_eq!(
+      futures_util::FutureExt::now_or_never(send_req.idle()),
+      Some(Settled::Idle)
+    );
+    drop((connection, server_io));
+  }
+
+  #[tokio::test]
+  async fn idle_waits_until_the_running_request_finishes() {
+    let (send_req, driver, mut server_io, response) = running_request().await;
+    let sender = send_req.clone();
+    let idle = tokio::spawn(async move { sender.idle().await });
+    assert!(!settles(&idle).await, "idle waits while the request runs");
+
+    let mut answer = record(RecordType::Stdout, b"Content-Type: text/plain\r\n\r\ndone");
+    answer.extend(record(RecordType::Stdout, b""));
+    answer.extend(end_request());
+    server_io.write_all(&answer).await.unwrap();
+    assert!(settles(&response).await, "the response ends");
+    assert_eq!(
+      response.await.unwrap().expect("a response"),
+      Bytes::from_static(b"done")
+    );
+    assert!(settles(&idle).await, "idle ends with the request");
+    assert_eq!(idle.await.unwrap(), Settled::Idle);
+    assert!(!driver.is_finished(), "the connection stays open");
+    driver.abort();
+  }
+
+  #[tokio::test]
+  async fn idle_ends_when_the_connection_ends_with_a_request_running() {
+    let (send_req, driver, server_io, response) = running_request().await;
+    let sender = send_req.clone();
+    let idle = tokio::spawn(async move { sender.idle().await });
+    assert!(!settles(&idle).await, "idle waits while the request runs");
+
+    // The driver goes away without finishing the request.
+    driver.abort();
+    assert!(settles(&idle).await, "idle ends with the connection");
+    assert_eq!(idle.await.unwrap(), Settled::Ended);
+    assert_eq!(send_req.in_flight(), 1, "the request never finished");
+    assert!(settles(&response).await, "the response fails");
+    assert!(response.await.unwrap().is_err());
+    drop(server_io);
   }
 }

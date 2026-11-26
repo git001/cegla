@@ -12,6 +12,7 @@
 - The FastCGI client now sends `FCGI_ABORT_REQUEST` when a response is dropped before it ends, so the server can stop the request. It does so only to a server that said it multiplexes connections (`Builder::get_values`), as php-fpm would close a kept-alive connection on it.
 - FastCGI client's `SendRequest` is now `Clone`; clones send over the same connection.
 - Added `SendRequest::in_flight`, the number of requests on a FastCGI client connection that haven't finished.
+- Added `SendRequest::idle`, which waits until no request runs on a FastCGI client connection any more, or the connection has ended (`Settled::Idle`, `Settled::Ended`).
 - A FastCGI client `Connection` now resolves to `Closed` when it ends without an error, saying whether the server closed it (`Closed::ByServer`) or every `SendRequest` was dropped (`Closed::ByClient`), instead of `()`.
 
 ## `cegla` 0.2.3 - April 25, 2026
