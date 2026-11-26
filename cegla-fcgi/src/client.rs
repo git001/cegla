@@ -51,6 +51,9 @@ pub struct FcgiResponseReader {
   // For the stdout reader: the connection to wake when the reader is
   // dropped, so it can abort a request whose response nobody reads.
   wake_on_drop: Option<Arc<Shared>>,
+  // For the stdout reader: set when the connection gave up the response,
+  // because more of it waited than `max_unread`.
+  given_up: Option<Arc<AtomicBool>>,
 }
 
 impl Drop for FcgiResponseReader {
@@ -107,6 +110,11 @@ impl AsyncRead for FcgiResponseReader {
           if self.ended {
             return Poll::Ready(Ok(()));
           }
+          if let Some(given_up) = self.given_up.as_ref() {
+            if given_up.load(Ordering::Acquire) {
+              return Poll::Ready(Err(std::io::Error::other(ResponseUnread)));
+            }
+          }
           return Poll::Ready(Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "the FastCGI connection ended before the response did",
@@ -143,6 +151,85 @@ struct PendingRequest<B> {
   // The channel for the response, until a response future or a rejection
   // takes it.
   res_ch: Arc<std::sync::Mutex<Option<oneshot::Sender<ResponseResult>>>>,
+  // On a connection that multiplexes: STDOUT that waits for room in the
+  // reader's channel, in order, so that the connection reads on for the
+  // other requests; `None` for its end.
+  unread: VecDeque<Option<Vec<u8>>>,
+  // The bytes in `unread`.
+  unread_bytes: usize,
+  // Sends the first of `unread` once the reader has room.
+  deliver: Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
+  // Shared with the stdout reader: set when the response was given up.
+  given_up: Arc<AtomicBool>,
+}
+
+impl<B> PendingRequest<B> {
+  /// Passes `chunk` of STDOUT, or its end, on to the reader behind what
+  /// waits already; gives the response up when more than `max_unread` bytes
+  /// wait.
+  fn pass_stdout(&mut self, chunk: Option<Vec<u8>>, max_unread: usize) {
+    if self.stdout_tx.is_closed() {
+      // No reader, or given up: nobody reads it.
+      return;
+    }
+    let chunk = if self.unread.is_empty() && self.deliver.is_none() {
+      match self.stdout_tx.try_send(chunk) {
+        Ok(()) => return,
+        // The reader went just now.
+        Err(async_channel::TrySendError::Closed(gone)) => {
+          drop(gone);
+          return;
+        }
+        Err(async_channel::TrySendError::Full(chunk)) => chunk,
+      }
+    } else {
+      chunk
+    };
+    self.unread_bytes += chunk.as_ref().map_or(0, Vec::len);
+    self.unread.push_back(chunk);
+    if self.unread_bytes > max_unread {
+      self.give_up();
+    }
+  }
+
+  /// Gives up the response: what waits is dropped, and the reader fails
+  /// with [`ResponseUnread`]. Its closed channel also makes the connection
+  /// abort the request.
+  fn give_up(&mut self) {
+    self.unread.clear();
+    self.unread_bytes = 0;
+    self.deliver = None;
+    self.given_up.store(true, Ordering::Release);
+    if self.stdout_tx.close() {
+      // Closed now.
+    } else {
+      // The reader was gone already.
+    }
+  }
+
+  /// Moves waiting STDOUT on to the reader as it makes room; whether none
+  /// waits any more.
+  fn deliver_unread(&mut self, cx: &mut Context<'_>) -> bool {
+    loop {
+      if let Some(deliver) = self.deliver.as_mut() {
+        match deliver.as_mut().poll(cx) {
+          Poll::Ready(()) => self.deliver = None,
+          Poll::Pending => return false,
+        }
+      }
+      let Some(chunk) = self.unread.pop_front() else {
+        return true;
+      };
+      self.unread_bytes -= chunk.as_ref().map_or(0, Vec::len);
+      let tx = self.stdout_tx.clone();
+      self.deliver = Some(Box::pin(async move {
+        if let Err(gone) = tx.send(chunk).await {
+          // The reader went: nobody reads it.
+          drop(gone);
+        }
+      }));
+    }
+  }
 }
 
 /// The response to a request and the reader for its stderr.
@@ -170,6 +257,28 @@ impl std::fmt::Display for RequestRejected {
 }
 
 impl std::error::Error for RequestRejected {}
+
+/// More of a response waited for its reader than [`Builder::max_unread`] on
+/// a connection that multiplexes, so the connection gave it up and aborted
+/// its request: the other requests on the connection would otherwise have
+/// waited for that reader.
+///
+/// Reading the response fails with it inside a [`std::io::Error`]; get it
+/// with [`std::io::Error::get_ref`] and `downcast_ref`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseUnread;
+
+impl std::fmt::Display for ResponseUnread {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "the FastCGI response wasn't read fast enough and was given up")
+  }
+}
+
+impl std::error::Error for ResponseUnread {}
+
+/// How much of a response may wait for its reader by default on a
+/// connection that multiplexes, see [`Builder::max_unread`].
+const DEFAULT_MAX_UNREAD: usize = 1024 * 1024;
 
 /// Sleeps for the timeouts a [`Connection`] keeps, from whichever async
 /// runtime drives it.
@@ -399,6 +508,9 @@ pin_project_lite::pin_project! {
     stdout_send: Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
     // Requests that were running when the server closed the connection.
     cut_off: usize,
+    // How much of a response may wait for its reader on a connection that
+    // multiplexes.
+    max_unread: usize,
     // How long an aborted request may take to end, if limited.
     abort_timeout: Option<AbortTimeout>,
     // Wakes the connection when the oldest unanswered abort is due.
@@ -788,11 +900,13 @@ where
           // stderr sent before the response headers can't wait for it.
           let (stderr_tx, stderr_rx) = async_channel::unbounded::<Option<Vec<u8>>>();
 
+          let given_up = Arc::new(AtomicBool::new(false));
           let reader = FcgiResponseReader {
             rx: Box::pin(stdout_rx),
             leftover: None,
             ended: false,
             wake_on_drop: Some(Arc::clone(this.shared)),
+            given_up: Some(Arc::clone(&given_up)),
           };
 
           // Spawn the response-conversion future inside the Connection so it
@@ -810,6 +924,7 @@ where
                     leftover: None,
                     ended: false,
                     wake_on_drop: None,
+                    given_up: None,
                   },
                 )
               }));
@@ -831,6 +946,10 @@ where
               aborted: None,
               response_futures,
               res_ch,
+              unread: VecDeque::new(),
+              unread_bytes: 0,
+              deliver: None,
+              given_up,
             },
           );
         }
@@ -979,7 +1098,13 @@ where
                 // Empty STDOUT = EOF sentinel.
                 pending.stdout_ended |= record.content.is_empty();
                 let chunk = (!record.content.is_empty()).then_some(record.content);
-                *this.stdout_send = send_stdout(&pending.stdout_tx, chunk);
+                if this.shared.multiplexes.load(Ordering::Relaxed) {
+                  // Read on for the other requests.
+                  pending.pass_stdout(chunk, *this.max_unread);
+                } else {
+                  // The one request: the server waits for its reader.
+                  *this.stdout_send = send_stdout(&pending.stdout_tx, chunk);
+                }
               }
             }
             Some(RecordType::Stderr) => {
@@ -999,7 +1124,11 @@ where
                 // makes the reader fail.
                 if !pending.stdout_ended {
                   pending.stdout_ended = true;
-                  *this.stdout_send = send_stdout(&pending.stdout_tx, None);
+                  if this.shared.multiplexes.load(Ordering::Relaxed) {
+                    pending.pass_stdout(None, *this.max_unread);
+                  } else {
+                    *this.stdout_send = send_stdout(&pending.stdout_tx, None);
+                  }
                 }
                 // The stderr channel is unbounded, so this fails only when
                 // its reader is gone and needs no sentinel.
@@ -1050,6 +1179,7 @@ where
     // ------------------------------------------------------------------
     let mut finished_ids: Vec<u16> = Vec::new();
     for (&request_id, pending) in this.pending.iter_mut() {
+      let delivered = pending.deliver_unread(cx);
       while let Poll::Ready(Some(())) = pending.response_futures.poll_next_unpin(cx) {}
 
       // The response was dropped before it ended, or the caller stopped
@@ -1069,9 +1199,9 @@ where
         cx.waker().wake_by_ref();
       }
 
-      // A request is fully done when END_REQUEST arrived and all response
-      // futures have completed.
-      if pending.end_received && pending.response_futures.is_empty() {
+      // A request is fully done when END_REQUEST arrived, its STDOUT has
+      // reached the reader, and all response futures have completed.
+      if pending.end_received && delivered && pending.response_futures.is_empty() {
         finished_ids.push(request_id);
       }
     }
@@ -1283,6 +1413,7 @@ pub struct Builder {
   keepalive: bool,
   max_requests: usize,
   get_values: bool,
+  max_unread: usize,
   abort_timeout: Option<AbortTimeout>,
 }
 
@@ -1299,6 +1430,7 @@ impl Builder {
       keepalive: false,
       max_requests: usize::MAX,
       get_values: false,
+      max_unread: DEFAULT_MAX_UNREAD,
       abort_timeout: None,
     }
   }
@@ -1328,6 +1460,18 @@ impl Builder {
   /// The handshake then waits for the answer, so wrap it in a timeout.
   pub fn get_values(&mut self, enabled: bool) -> &mut Self {
     self.get_values = enabled;
+    self
+  }
+
+  /// Sets how many bytes of a response may wait for its reader on a
+  /// connection that multiplexes, 1 MiB by default. FastCGI can't tell the
+  /// server to pause one request, so the connection reads on for the other
+  /// requests and keeps what a slow reader hasn't taken yet; past this, it
+  /// gives the response up, aborts its request, and the reader fails with
+  /// [`ResponseUnread`]. A connection that runs one request at a time
+  /// instead stops reading from the server until the reader takes more.
+  pub fn max_unread(&mut self, bytes: usize) -> &mut Self {
+    self.max_unread = bytes;
     self
   }
 
@@ -1393,6 +1537,7 @@ impl Builder {
         write_queue: VecDeque::new(),
         stdout_send: None,
         cut_off: 0,
+        max_unread: self.max_unread,
         abort_timeout: self.abort_timeout.clone(),
         abort_sleep: None,
       },
@@ -1492,6 +1637,7 @@ mod tests {
       write_queue: VecDeque::new(),
       stdout_send: None,
       cut_off: 0,
+      max_unread: DEFAULT_MAX_UNREAD,
       abort_timeout: None,
       abort_sleep: None,
     };
@@ -2973,11 +3119,12 @@ mod known_issue_tests {
     http::Request::builder().uri("http://backend/").body(body).unwrap()
   }
 
-  /// Right: a response nobody reads holds up only itself.
-  /// Today: once its channel is full, the connection reads nothing more from
-  /// the server, so every other request on the connection waits as well.
+  /// Without multiplexing, a response nobody reads holds up the connection:
+  /// once its channel is full, the connection reads nothing more, so the
+  /// server waits for the reader. That is the backpressure a server that
+  /// runs one request at a time, php-fpm say, needs.
   #[tokio::test]
-  async fn known_issue_an_unread_response_stalls_the_other_requests() {
+  async fn without_multiplexing_an_unread_response_holds_up_the_connection() {
     let (client_io, server_io) = tokio::io::duplex(1 << 20);
     let (send_req, connection) = handshake::<tokio::io::DuplexStream, Full<Bytes>>(client_io, true)
       .await
@@ -3015,7 +3162,7 @@ mod known_issue_tests {
 
     assert!(settles(&unread).await, "the unread response's headers arrive");
     let (unread, unread_stderr) = unread.await.unwrap().expect("a response");
-    assert!(!settles(&read).await, "known issue: the other response waits");
+    assert!(!settles(&read).await, "the other response waits");
     assert_eq!(send_req.in_flight(), 2);
 
     // Counter-check: the unread response alone holds the other one up.
@@ -3026,6 +3173,174 @@ mod known_issue_tests {
     );
     assert_eq!(read.await.unwrap().expect("a response"), Bytes::from_static(b"read"));
     driver.abort();
+  }
+
+  /// A response that is read, on a multiplexed connection, behind one that
+  /// isn't read.
+  struct BehindAnUnreadResponse {
+    send_req: SendRequest<Full<Bytes>>,
+    driver: tokio::task::JoinHandle<Result<Closed, std::io::Error>>,
+    server: Server,
+    server_write: WriteHalf<tokio::io::DuplexStream>,
+    unread_id: u16,
+    // The response nobody reads yet, once its headers came.
+    unread: http::Response<CgiIncoming<cegla::client::CgiResponseInner<FcgiResponseReader>>>,
+    unread_stderr: FcgiResponseReader,
+    // The response that is read: its body, once it ended.
+    read: tokio::task::JoinHandle<Result<Bytes, std::io::Error>>,
+  }
+
+  /// How much of the unread response's body the server sends.
+  const UNREAD_BODY: usize = 200 * 1000;
+
+  /// Two requests on a connection made with `max_unread` to a server that
+  /// multiplexes: the first one's response has far more STDOUT than its
+  /// channel holds and nobody reads it; the second one's is whole.
+  async fn behind_an_unread_response(max_unread: usize) -> BehindAnUnreadResponse {
+    use tokio::io::AsyncWriteExt;
+
+    let (client_io, server_io) = tokio::io::duplex(1 << 20);
+    let (server_read, mut server_write) = tokio::io::split(server_io);
+    let mut server = FramedRead::new(server_read, Decoder::default());
+    let builder = Builder::new()
+      .keepalive(true)
+      .get_values(true)
+      .max_unread(max_unread)
+      .clone();
+    let handshake = tokio::spawn(async move {
+      builder
+        .handshake::<tokio::io::DuplexStream, Full<Bytes>>(client_io)
+        .await
+    });
+    let get_values = server.next().await.expect("a record").expect("a valid record");
+    assert_eq!(get_values.record_type, RecordType::GetValues.as_u8());
+    let values = NameValuePair::from_slices(b"FCGI_MPXS_CONNS", b"1").encode();
+    server_write
+      .write_all(&record_for(RecordType::GetValuesResult, 0, &values))
+      .await
+      .unwrap();
+    let (send_req, connection) = handshake.await.unwrap().unwrap();
+    let driver = tokio::spawn(connection);
+
+    let sender = send_req.clone();
+    let unread = tokio::spawn(async move { sender.send_request(request(Full::default()), CgiBuilder::new()).await });
+    let (unread_id, unread_stdin) = read_request(&mut server).await;
+    assert!(unread_stdin.is_empty());
+    let sender = send_req.clone();
+    let read = tokio::spawn(async move {
+      let (response, stderr) = sender.send_request(request(Full::default()), CgiBuilder::new()).await?;
+      drop(stderr);
+      let body = response.into_body().collect().await?;
+      Ok::<Bytes, std::io::Error>(body.to_bytes())
+    });
+    let (read_id, read_stdin) = read_request(&mut server).await;
+    assert!(read_stdin.is_empty());
+
+    let mut answer = record_for(RecordType::Stdout, unread_id, b"Content-Type: text/plain\r\n\r\n");
+    answer.extend(
+      std::iter::repeat_n(
+        record_for(RecordType::Stdout, unread_id, &[b'u'; 1000]),
+        UNREAD_BODY / 1000,
+      )
+      .flatten(),
+    );
+    answer.extend(record_for(
+      RecordType::Stdout,
+      read_id,
+      b"Content-Type: text/plain\r\n\r\nread",
+    ));
+    answer.extend(record_for(RecordType::Stdout, read_id, b""));
+    answer.extend(record_for(RecordType::EndRequest, read_id, &[0; 8]));
+    server_write.write_all(&answer).await.unwrap();
+
+    assert!(settles(&unread).await, "the unread response's headers arrive");
+    let (unread, unread_stderr) = unread.await.unwrap().expect("a response");
+    BehindAnUnreadResponse {
+      send_req,
+      driver,
+      server,
+      server_write,
+      unread_id,
+      unread,
+      unread_stderr,
+      read,
+    }
+  }
+
+  /// On a multiplexed connection, a response nobody reads holds up only
+  /// itself: the connection keeps what waits, up to `max_unread`, and reads
+  /// on for the other requests. The waiting response is whole once read.
+  #[tokio::test]
+  async fn an_unread_response_holds_up_only_itself() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut behind = behind_an_unread_response(DEFAULT_MAX_UNREAD).await;
+    assert!(settles(&behind.read).await, "the other response ends");
+    assert_eq!(
+      behind.read.await.unwrap().expect("a response"),
+      Bytes::from_static(b"read")
+    );
+    assert_eq!(behind.send_req.in_flight(), 1, "the unread request runs on");
+
+    let mut end = record_for(RecordType::Stdout, behind.unread_id, b"");
+    end.extend(record_for(RecordType::EndRequest, behind.unread_id, &[0; 8]));
+    behind.server_write.write_all(&end).await.unwrap();
+    let body = behind.unread.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.len(), UNREAD_BODY, "nothing of it was lost");
+    assert!(body.iter().all(|&byte| byte == b'u'));
+    assert!(
+      comes_true(|| behind.send_req.in_flight() == 0).await,
+      "the request has finished"
+    );
+    behind.driver.abort();
+    drop((behind.server, behind.unread_stderr));
+  }
+
+  /// On a multiplexed connection, a response of which more waits than
+  /// `max_unread` is given up: its request is aborted, and reading it fails
+  /// with [`ResponseUnread`]; the other requests run on.
+  #[tokio::test]
+  async fn a_response_unread_past_max_unread_is_given_up() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut behind = behind_an_unread_response(64 * 1024).await;
+    assert!(settles(&behind.read).await, "the other response ends");
+    assert_eq!(
+      behind.read.await.unwrap().expect("a response"),
+      Bytes::from_static(b"read")
+    );
+    loop {
+      let record = behind.server.next().await.expect("a record").expect("a valid record");
+      if record.record_type == RecordType::AbortRequest.as_u8() {
+        assert_eq!(record.request_id, behind.unread_id);
+        break;
+      }
+    }
+    match behind.unread.into_body().collect().await {
+      Ok(body) => panic!(
+        "the response was given up, yet {} bytes read to its end",
+        body.to_bytes().len()
+      ),
+      Err(err) => assert_eq!(
+        err.get_ref().and_then(|inner| inner.downcast_ref::<ResponseUnread>()),
+        Some(&ResponseUnread)
+      ),
+    }
+
+    // The server ends the aborted request; the connection runs on.
+    behind
+      .server_write
+      .write_all(&record_for(RecordType::EndRequest, behind.unread_id, &[0; 8]))
+      .await
+      .unwrap();
+    assert!(
+      comes_true(|| behind.send_req.in_flight() == 0).await,
+      "the aborted request has finished"
+    );
+    assert!(!behind.driver.is_finished());
+    assert!(!behind.send_req.is_closed());
+    behind.driver.abort();
+    drop(behind.unread_stderr);
   }
 
   /// Sleeps on a thread of its own: the tests' runtime has no timer.
