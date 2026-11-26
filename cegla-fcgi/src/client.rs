@@ -2265,7 +2265,7 @@ mod cut_off_tests {
 
   /// Yields until `task` is done, as long as a ready task could take; whether
   /// it is done by then.
-  async fn settles<T>(task: &tokio::task::JoinHandle<T>) -> bool {
+  pub(super) async fn settles<T>(task: &tokio::task::JoinHandle<T>) -> bool {
     let mut rounds = 0;
     while rounds < 2000 && !task.is_finished() {
       tokio::task::yield_now().await;
@@ -2275,7 +2275,14 @@ mod cut_off_tests {
   }
 
   fn record(record_type: RecordType, content: &[u8]) -> Vec<u8> {
-    Record::new(record_type.as_u8(), 1, content.to_vec()).encode().unwrap()
+    record_for(record_type, 1, content)
+  }
+
+  /// A record of `record_type` for request `request_id`.
+  pub(super) fn record_for(record_type: RecordType, request_id: u16, content: &[u8]) -> Vec<u8> {
+    Record::new(record_type.as_u8(), request_id, content.to_vec())
+      .encode()
+      .unwrap()
   }
 
   fn end_request() -> Vec<u8> {
@@ -2708,5 +2715,258 @@ mod cut_off_tests {
       rounds += 1;
     }
     done()
+  }
+}
+
+#[cfg(test)]
+mod known_issue_tests {
+  //! Behaviour that is wrong today. Each test shows the issue as it is, so a
+  //! fix has to change the test; its comment says what would be right.
+
+  use std::sync::atomic::AtomicUsize;
+
+  use http_body::Frame;
+  use http_body_util::{combinators::BoxBody, Full, StreamBody};
+  use tokio::io::AsyncWriteExt;
+
+  use super::cut_off_tests::{record_for, settles};
+  use super::*;
+  use crate::protocol::codec::{Decoder, Encoder};
+
+  type Server = FramedRead<ReadHalf<tokio::io::DuplexStream>, Decoder>;
+  type Streamed = BoxBody<Bytes, std::io::Error>;
+
+  /// Yields `rounds` times, so ready tasks can run.
+  async fn yield_rounds(rounds: usize) {
+    let mut done = 0;
+    while done < rounds {
+      tokio::task::yield_now().await;
+      done += 1;
+    }
+  }
+
+  /// Yields until `done` holds, as long as a ready task could take; whether
+  /// it does by then.
+  async fn comes_true(done: impl Fn() -> bool) -> bool {
+    let mut rounds = 0;
+    while rounds < 2000 && !done() {
+      tokio::task::yield_now().await;
+      rounds += 1;
+    }
+    done()
+  }
+
+  /// Reads records until a request's STDIN ends; that request's ID and the
+  /// STDIN it got.
+  async fn read_request(server: &mut Server) -> (u16, Vec<u8>) {
+    let mut stdin = Vec::new();
+    loop {
+      let record = server.next().await.expect("a record").expect("a valid record");
+      if record.record_type == RecordType::Stdin.as_u8() {
+        if record.content.is_empty() {
+          return (record.request_id, stdin);
+        }
+        stdin.extend_from_slice(&record.content);
+      }
+    }
+  }
+
+  fn request<B>(body: B) -> http::Request<B> {
+    http::Request::builder().uri("http://backend/").body(body).unwrap()
+  }
+
+  /// Right: a response nobody reads holds up only itself.
+  /// Today: once its channel is full, the connection reads nothing more from
+  /// the server, so every other request on the connection waits as well.
+  #[tokio::test]
+  async fn known_issue_an_unread_response_stalls_the_other_requests() {
+    let (client_io, server_io) = tokio::io::duplex(1 << 20);
+    let (send_req, connection) = handshake::<tokio::io::DuplexStream, Full<Bytes>>(client_io, true)
+      .await
+      .unwrap();
+    let driver = tokio::spawn(connection);
+    let (server_read, mut server_write) = tokio::io::split(server_io);
+    let mut server = FramedRead::new(server_read, Decoder::default());
+
+    let sender = send_req.clone();
+    let unread = tokio::spawn(async move { sender.send_request(request(Full::default()), CgiBuilder::new()).await });
+    let (unread_id, unread_stdin) = read_request(&mut server).await;
+    assert!(unread_stdin.is_empty());
+    let sender = send_req.clone();
+    let read = tokio::spawn(async move {
+      let (response, stderr) = sender.send_request(request(Full::default()), CgiBuilder::new()).await?;
+      drop(stderr);
+      let body = response.into_body().collect().await?;
+      Ok::<Bytes, std::io::Error>(body.to_bytes())
+    });
+    let (read_id, read_stdin) = read_request(&mut server).await;
+    assert!(read_stdin.is_empty());
+
+    // Far more STDOUT for the first request than its channel holds, then the
+    // whole second response.
+    let mut answer = record_for(RecordType::Stdout, unread_id, b"Content-Type: text/plain\r\n\r\n");
+    answer.extend(std::iter::repeat_n(record_for(RecordType::Stdout, unread_id, &[b'u'; 1000]), 200).flatten());
+    answer.extend(record_for(
+      RecordType::Stdout,
+      read_id,
+      b"Content-Type: text/plain\r\n\r\nread",
+    ));
+    answer.extend(record_for(RecordType::Stdout, read_id, b""));
+    answer.extend(record_for(RecordType::EndRequest, read_id, &[0; 8]));
+    server_write.write_all(&answer).await.unwrap();
+
+    assert!(settles(&unread).await, "the unread response's headers arrive");
+    let (unread, unread_stderr) = unread.await.unwrap().expect("a response");
+    assert!(!settles(&read).await, "known issue: the other response waits");
+    assert_eq!(send_req.in_flight(), 2);
+
+    // Counter-check: the unread response alone holds the other one up.
+    drop((unread, unread_stderr));
+    assert!(
+      settles(&read).await,
+      "the other response ends once the unread one is gone"
+    );
+    assert_eq!(read.await.unwrap().expect("a response"), Bytes::from_static(b"read"));
+    driver.abort();
+  }
+
+  /// Right: a request whose `FCGI_ABORT_REQUEST` the server never answers
+  /// gives up its place after a while, or its connection ends.
+  /// Today: it keeps its place as long as the connection is open; no timer
+  /// runs for it.
+  #[tokio::test]
+  async fn known_issue_an_unanswered_abort_keeps_its_place() {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let (server_read, server_write) = tokio::io::split(server_io);
+    let mut server = FramedRead::new(server_read, Decoder::default());
+    let mut server_out = FramedWrite::new(server_write, Encoder);
+    let backend = tokio::spawn(async move {
+      let get_values = server.next().await.expect("a record").expect("a valid record");
+      assert_eq!(get_values.record_type, RecordType::GetValues.as_u8());
+      let values = NameValuePair::from_slices(b"FCGI_MPXS_CONNS", b"1").encode().to_vec();
+      server_out
+        .send(Record::new(RecordType::GetValuesResult.as_u8(), 0, values))
+        .await
+        .unwrap();
+      let (request_id, stdin) = read_request(&mut server).await;
+      assert!(stdin.is_empty());
+      let headers = b"Content-Type: text/plain\r\n\r\n".to_vec();
+      server_out
+        .send(Record::new(RecordType::Stdout.as_u8(), request_id, headers))
+        .await
+        .unwrap();
+      loop {
+        let record = server.next().await.expect("a record").expect("a valid record");
+        if record.record_type == RecordType::AbortRequest.as_u8() {
+          // The connection stays open, the request unanswered.
+          return (request_id, server, server_out);
+        }
+      }
+    });
+    let builder = Builder::new().keepalive(true).get_values(true).clone();
+    let (send_req, connection) = builder
+      .handshake::<tokio::io::DuplexStream, Full<Bytes>>(client_io)
+      .await
+      .unwrap();
+    let driver = tokio::spawn(connection);
+    let (response, stderr) = send_req
+      .send_request(request(Full::default()), CgiBuilder::new())
+      .await
+      .unwrap();
+    drop((response, stderr));
+
+    assert!(settles(&backend).await, "the server gets FCGI_ABORT_REQUEST");
+    let (request_id, server, mut server_out) = backend.await.unwrap();
+    yield_rounds(2000).await;
+    assert!(!driver.is_finished(), "the connection runs on");
+    assert_eq!(
+      send_req.in_flight(),
+      1,
+      "known issue: the aborted request keeps its place"
+    );
+
+    // Counter-check: the place is free once the server ends the request.
+    server_out
+      .send(Record::new(RecordType::EndRequest.as_u8(), request_id, vec![0; 8]))
+      .await
+      .unwrap();
+    assert!(
+      comes_true(|| send_req.in_flight() == 0).await,
+      "the ended request gives up its place"
+    );
+    driver.abort();
+    drop((server, server_out));
+  }
+
+  /// Right: STDIN goes to the server about as fast as the server reads it.
+  /// Today: the connection takes the whole request body at once and queues
+  /// it in memory, however little the server reads.
+  #[tokio::test]
+  async fn known_issue_a_request_body_is_queued_whole() {
+    const CHUNKS: usize = 256;
+    const CHUNK: usize = 4096;
+    // The server reads nothing, so about this much can leave the queue.
+    let (client_io, server_io) = tokio::io::duplex(CHUNK);
+    let (send_req, connection) = handshake::<tokio::io::DuplexStream, Streamed>(client_io, true)
+      .await
+      .unwrap();
+    let taken = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&taken);
+    let frames = (0..CHUNKS).map(move |chunk| {
+      counter.fetch_add(1, Ordering::Relaxed);
+      let byte = u8::try_from(chunk % 256).expect("below 256");
+      Ok::<Frame<Bytes>, std::io::Error>(Frame::data(Bytes::from(vec![byte; CHUNK])))
+    });
+    let body = BoxBody::new(StreamBody::new(futures_util::stream::iter(frames)));
+    let sending = tokio::spawn(async move { send_req.send_request(request(body), CgiBuilder::new()).await });
+    let driver = tokio::spawn(connection);
+
+    assert!(
+      comes_true(|| taken.load(Ordering::Relaxed) == CHUNKS).await,
+      "known issue: the whole body of {} KiB is taken",
+      CHUNKS * CHUNK / 1024
+    );
+    assert!(!sending.is_finished(), "the server has not answered");
+    sending.abort();
+    driver.abort();
+    drop(server_io);
+  }
+
+  /// Right: a request body that fails is not passed on as whole: the request
+  /// is aborted or its connection closed, and the error is reported.
+  /// Today: the error is dropped and STDIN ends as if the body were whole;
+  /// the end of the body then ends STDIN a second time.
+  #[tokio::test]
+  async fn known_issue_a_failed_request_body_reaches_the_server_as_whole() {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let (send_req, connection) = handshake::<tokio::io::DuplexStream, Streamed>(client_io, true)
+      .await
+      .unwrap();
+    let driver = tokio::spawn(connection);
+    let frames: Vec<Result<Frame<Bytes>, std::io::Error>> = vec![
+      Ok(Frame::data(Bytes::from_static(b"part"))),
+      Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+    ];
+    let body = BoxBody::new(StreamBody::new(futures_util::stream::iter(frames)));
+    let sending = tokio::spawn(async move { send_req.send_request(request(body), CgiBuilder::new()).await });
+    let (server_read, server_write) = tokio::io::split(server_io);
+    let mut server = FramedRead::new(server_read, Decoder::default());
+
+    let (request_id, stdin) = read_request(&mut server).await;
+    assert_eq!(stdin, b"part", "known issue: the cut-off body ends like a whole one");
+    yield_rounds(100).await;
+    let mut more = Vec::new();
+    while let Some(Some(record)) = futures_util::FutureExt::now_or_never(server.next()) {
+      let record = record.expect("a valid record");
+      more.push((record.record_type, record.request_id, record.content));
+    }
+    assert_eq!(
+      more,
+      [(RecordType::Stdin.as_u8(), request_id, Vec::new())],
+      "known issue: STDIN ends a second time, and nothing aborts the request"
+    );
+    sending.abort();
+    driver.abort();
+    drop(server_write);
   }
 }
