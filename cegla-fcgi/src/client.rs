@@ -316,6 +316,12 @@ where
       .map_err(|_| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "unknown error obtaining response"))?
   }
 
+  /// The requests on the connection that haven't finished: running, or
+  /// sent and waiting for room.  `0` means the connection is idle.
+  pub fn in_flight(&self) -> usize {
+    self.shared.in_flight.load(Ordering::Relaxed)
+  }
+
   /// Check if the connection is closed.
   pub fn is_closed(&self) -> bool {
     self.send_request_tx.is_closed()
@@ -2084,5 +2090,51 @@ mod cut_off_tests {
       ended.expect("the connection ends").expect("without an error"),
       Closed::ByClient
     );
+  }
+
+  #[tokio::test]
+  async fn in_flight_counts_a_request_until_it_finishes() {
+    let (client_io, mut server_io) = tokio::io::duplex(65536);
+    let (send_req, connection) = handshake::<_, http_body_util::Full<Bytes>>(client_io, true)
+      .await
+      .unwrap();
+    let driver = tokio::spawn(connection);
+    assert_eq!(send_req.in_flight(), 0, "a new connection is idle");
+
+    let sender = send_req.clone();
+    let response = tokio::spawn(async move {
+      let req = http::Request::builder()
+        .uri("http://backend/")
+        .body(http_body_util::Full::<Bytes>::from(""))
+        .unwrap();
+      let (response, stderr) = sender.send_request(req, CgiBuilder::new()).await?;
+      drop(stderr);
+      let body = response.into_body().collect().await?;
+      Ok::<_, std::io::Error>(body.to_bytes())
+    });
+    let mut request = vec![0u8; 4096];
+    let read = server_io.read(&mut request).await.unwrap();
+    assert!(read > 0, "the request arrives");
+    assert_eq!(send_req.in_flight(), 1, "the request runs");
+
+    let mut answer = record(RecordType::Stdout, b"Content-Type: text/plain\r\n\r\ndone");
+    answer.extend(record(RecordType::Stdout, b""));
+    answer.extend(end_request());
+    server_io.write_all(&answer).await.unwrap();
+    assert!(settles(&response).await, "the response ends");
+    assert_eq!(
+      response.await.unwrap().expect("a response"),
+      Bytes::from_static(b"done")
+    );
+
+    let mut rounds = 0;
+    while rounds < 2000 && send_req.in_flight() > 0 {
+      tokio::task::yield_now().await;
+      rounds += 1;
+    }
+    assert_eq!(send_req.in_flight(), 0, "the connection is idle again");
+    drop(send_req);
+    assert!(settles(&driver).await, "the connection ends without handles");
+    assert_eq!(driver.await.unwrap().expect("without an error"), Closed::ByClient);
   }
 }
