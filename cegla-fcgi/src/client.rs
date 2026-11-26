@@ -333,6 +333,16 @@ where
   }
 }
 
+/// How a FastCGI client [`Connection`] ended without an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Closed {
+  /// The server closed the connection while no request ran on it.
+  ByServer,
+  /// Every [`SendRequest`] for the connection was dropped while no request
+  /// ran on it.
+  ByClient,
+}
+
 // ---------------------------------------------------------------------------
 // Connection::poll  (the core state machine)
 // ---------------------------------------------------------------------------
@@ -343,7 +353,7 @@ where
   B: Body + Send + 'static,
   B::Data: AsRef<[u8]> + Send + 'static,
 {
-  type Output = Result<(), std::io::Error>;
+  type Output = Result<Closed, std::io::Error>;
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
     let mut this = self.project();
@@ -498,7 +508,7 @@ where
         Poll::Ready(None) => {
           // All SendRequest handles dropped – begin graceful shutdown.
           if this.pending.is_empty() {
-            return Poll::Ready(Ok(()));
+            return Poll::Ready(Ok(Closed::ByClient));
           }
           break;
         }
@@ -758,7 +768,7 @@ where
             ),
           )));
         }
-        return Poll::Ready(Ok(()));
+        return Poll::Ready(Ok(Closed::ByServer));
       }
     }
 
@@ -1383,7 +1393,7 @@ mod tests {
 
     // Connection should complete when pending is empty
     let result = connection.await;
-    assert!(result.is_ok());
+    assert_eq!(result.expect("without an error"), Closed::ByClient);
   }
 
   /// Encode a response of `records` FCGI_STDOUT records of `size` bytes each
@@ -1978,7 +1988,7 @@ mod cut_off_tests {
   /// The outcome of one request to a server that waits for it, answers
   /// `answer`, and then closes the connection if `close` is set; and the
   /// outcome of the connection.
-  async fn request(answer: Vec<u8>, close: bool) -> (Result<Bytes, std::io::Error>, Option<std::io::Result<()>>) {
+  async fn request(answer: Vec<u8>, close: bool) -> (Result<Bytes, std::io::Error>, Option<std::io::Result<Closed>>) {
     let (client_io, mut server_io) = tokio::io::duplex(65536);
     let (send_req, connection) = handshake::<_, http_body_util::Full<Bytes>>(client_io, true)
       .await
@@ -2056,7 +2066,10 @@ mod cut_off_tests {
     answer.extend(end_request());
     let (outcome, ended) = request(answer, true).await;
     assert_eq!(outcome.expect("a response"), Bytes::from_static(b"all"));
-    assert!(ended.expect("the connection ends").is_ok());
+    assert_eq!(
+      ended.expect("the connection ends").expect("without an error"),
+      Closed::ByServer
+    );
   }
 
   #[tokio::test]
@@ -2067,6 +2080,9 @@ mod cut_off_tests {
     assert_eq!(outcome.expect("a response"), Bytes::from_static(b"all"));
     // The server keeps the connection open; it ends because the request's
     // handle, the only one, is gone.
-    assert!(ended.expect("the connection ends").is_ok());
+    assert_eq!(
+      ended.expect("the connection ends").expect("without an error"),
+      Closed::ByClient
+    );
   }
 }
