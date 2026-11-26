@@ -14,6 +14,7 @@
 - Added `SendRequest::in_flight`, the number of requests on a FastCGI client connection that haven't finished.
 - Added `SendRequest::idle`, which waits until no request runs on a FastCGI client connection any more, or the connection has ended (`Settled::Idle`, `Settled::Ended`).
 - Added `SendRequest::idle_since`, since when no request runs on a FastCGI client connection, and `SendRequest::close`, which stops it from taking new requests and ends it once the running ones have.
+- Added `SendRequest::try_send_request`, which hands a request to a FastCGI client connection at once and gives it back whole (`Unsent`) if the connection doesn't take requests any more, so that it can be sent on another connection.
 - A FastCGI client request that the connection never sent now fails with a `NotSent` error inside the `std::io::Error` (`NotSent::Closed`, `NotSent::NoRequestId`), so a caller can tell that sending it again is safe; the error kinds stay as they were, except that a request sent on a closed connection now fails with `NotSent::Closed` instead of "underlying connection closed".
 - A FastCGI client `Connection` now resolves to `Closed` when it ends without an error, saying whether the server closed it (`Closed::ByServer`) or every `SendRequest` was dropped (`Closed::ByClient`), instead of `()`.
 

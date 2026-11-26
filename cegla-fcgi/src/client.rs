@@ -195,6 +195,14 @@ impl std::fmt::Display for NotSent {
 
 impl std::error::Error for NotSent {}
 
+/// A request that [`SendRequest::try_send_request`] gave back whole, because
+/// the connection doesn't take requests any more: nothing of it was sent, so
+/// it can go to another connection.
+pub struct Unsent<B> {
+  pub request: http::Request<B>,
+  pub builder: CgiBuilder,
+}
+
 /// An error for a request the connection never sent, with the kind it has
 /// always had for `why`.
 fn not_sent(why: NotSent) -> std::io::Error {
@@ -398,6 +406,10 @@ where
   B::Data: AsRef<[u8]> + Send + 'static,
 {
   /// Sends an HTTP request to the FastCGI application and awaits the response.
+  ///
+  /// A request the connection doesn't take any more fails with
+  /// [`NotSent::Closed`]; [`SendRequest::try_send_request`] gives it back
+  /// instead.
   pub async fn send_request(
     &self,
     req: http::Request<B>,
@@ -409,21 +421,47 @@ where
     ),
     std::io::Error,
   > {
+    match self.try_send_request(req, builder) {
+      Ok(response) => response.await,
+      Err(unsent) => {
+        drop(unsent);
+        Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, NotSent::Closed))
+      }
+    }
+  }
+
+  /// Hands an HTTP request to the connection at once and returns the future
+  /// of its response; or, if the connection doesn't take requests any more,
+  /// gives the request back whole, so it can be sent on another connection.
+  ///
+  /// The request counts in [`SendRequest::in_flight`] from this call on.
+  pub fn try_send_request(
+    &self,
+    req: http::Request<B>,
+    builder: CgiBuilder,
+  ) -> Result<impl Future<Output = ResponseResult> + Send + 'static, Box<Unsent<B>>> {
     let (res_ch, res_rx) = oneshot::channel();
     // The connection counts the request down when it's finished.
     self.shared.start_request();
-    if let Err(unsent) = self.send_request_tx.send(SentRequest { req, builder, res_ch }).await {
-      // The request comes back unsent.
-      drop(unsent);
-      self.shared.finish_request();
-      return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, NotSent::Closed));
+    match self.send_request_tx.try_send(SentRequest { req, builder, res_ch }) {
+      Ok(()) => Ok(async move {
+        res_rx.await.map_err(|gone| {
+          std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("unknown error obtaining response: {gone}"),
+          )
+        })?
+      }),
+      // The channel is unbounded, so it is only ever full if it is closed.
+      Err(async_channel::TrySendError::Closed(sent) | async_channel::TrySendError::Full(sent)) => {
+        self.shared.finish_request();
+        let SentRequest { req, builder, res_ch } = sent;
+        // No one waits on the other end.
+        drop((res_ch, res_rx));
+        // Boxed: it is the rare case, and the request is large.
+        Err(Box::new(Unsent { request: req, builder }))
+      }
     }
-    res_rx.await.map_err(|gone| {
-      std::io::Error::new(
-        std::io::ErrorKind::UnexpectedEof,
-        format!("unknown error obtaining response: {gone}"),
-      )
-    })?
   }
 
   /// The requests on the connection that haven't finished: running, or
@@ -2459,6 +2497,71 @@ mod cut_off_tests {
     );
     assert!(settles(&driver).await);
     assert!(driver.await.unwrap().is_err(), "a request was cut off");
+  }
+
+  #[tokio::test]
+  async fn try_send_request_gives_a_request_back_whole_once_closed() {
+    let (client_io, server_io) = tokio::io::duplex(65536);
+    let (send_req, connection) = handshake::<tokio::io::DuplexStream, http_body_util::Full<Bytes>>(client_io, true)
+      .await
+      .unwrap();
+    assert!(send_req.close());
+    let req = http::Request::builder()
+      .uri("http://backend/marked")
+      .header("x-marker", "kept")
+      .body(http_body_util::Full::<Bytes>::from("payload"))
+      .unwrap();
+    match send_req.try_send_request(req, CgiBuilder::new()) {
+      Ok(response) => {
+        drop(response);
+        panic!("a closed connection took the request");
+      }
+      Err(unsent) => {
+        let Unsent { request, builder } = *unsent;
+        drop(builder);
+        assert_eq!(request.uri(), "http://backend/marked");
+        assert_eq!(request.headers()["x-marker"], "kept");
+        let body = request.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from_static(b"payload"));
+      }
+    }
+    assert_eq!(send_req.in_flight(), 0, "the request given back isn't counted");
+    assert!(send_req.idle_since().is_some());
+    drop((connection, server_io));
+  }
+
+  #[tokio::test]
+  async fn try_send_request_counts_the_request_at_once_and_sends_it() {
+    let (client_io, mut server_io) = tokio::io::duplex(65536);
+    let (send_req, connection) = handshake::<tokio::io::DuplexStream, http_body_util::Full<Bytes>>(client_io, true)
+      .await
+      .unwrap();
+    let driver = tokio::spawn(connection);
+    let response = match send_req.try_send_request(get(), CgiBuilder::new()) {
+      Ok(response) => response,
+      Err(unsent) => panic!("an open connection gave back {}", unsent.request.uri()),
+    };
+    assert_eq!(send_req.in_flight(), 1, "counted before anything is awaited");
+    assert_eq!(send_req.idle_since(), None);
+    let response = tokio::spawn(async move {
+      let (response, stderr) = response.await?;
+      drop(stderr);
+      let body = response.into_body().collect().await?;
+      Ok::<Bytes, std::io::Error>(body.to_bytes())
+    });
+    let mut request = vec![0u8; 4096];
+    let read = server_io.read(&mut request).await.unwrap();
+    assert!(read > 0, "the request arrives");
+    let mut answer = record(RecordType::Stdout, b"Content-Type: text/plain\r\n\r\ndone");
+    answer.extend(record(RecordType::Stdout, b""));
+    answer.extend(end_request());
+    server_io.write_all(&answer).await.unwrap();
+    assert!(settles(&response).await, "the response ends");
+    assert_eq!(
+      response.await.unwrap().expect("a response"),
+      Bytes::from_static(b"done")
+    );
+    driver.abort();
   }
 
   /// Yields until `done` holds, as long as a ready task could take; whether
