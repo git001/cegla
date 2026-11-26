@@ -280,27 +280,6 @@ impl std::error::Error for ResponseUnread {}
 /// connection that multiplexes, see [`Builder::max_unread`].
 const DEFAULT_MAX_UNREAD: usize = 1024 * 1024;
 
-/// A request body failed on a connection that can't abort the request, so
-/// the connection ended: only that tells a server that doesn't multiplex,
-/// php-fpm say, that the body was cut off. The request itself fails with
-/// [`RequestBodyFailed`].
-///
-/// The [`Connection`] ends with it inside a [`std::io::Error`]; get it with
-/// [`std::io::Error::get_ref`] and `downcast_ref`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BodyCutOff;
-
-impl std::fmt::Display for BodyCutOff {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    write!(
-      f,
-      "a request body failed on a FastCGI connection that can't abort the request"
-    )
-  }
-}
-
-impl std::error::Error for BodyCutOff {}
-
 /// Sleeps for the timeouts a [`Connection`] keeps, from whichever async
 /// runtime drives it.
 pub trait Timer: Send + Sync {
@@ -349,10 +328,9 @@ impl std::error::Error for AbortUnanswered {}
 /// The request body failed while the connection sent it, so the FastCGI
 /// server got only part of it; the inner error is the body's.
 ///
-/// The request isn't finished as if the body were whole: on a connection
-/// that multiplexes, the server gets `FCGI_ABORT_REQUEST`; otherwise the
-/// connection ends with an error, as only that tells such a server, php-fpm
-/// say, that the body was cut off.
+/// The request isn't finished as if the body were whole: the server gets
+/// `FCGI_ABORT_REQUEST`, as for any request nobody waits for (see
+/// [`Builder::abort_timeout`]).
 ///
 /// [`SendRequest::send_request`] returns it inside a [`std::io::Error`]; get
 /// it with [`std::io::Error::get_ref`] and `downcast_ref`.
@@ -426,8 +404,10 @@ struct Shared {
   // The connection's task, for a dropped stdout reader to wake.
   waker: AtomicWaker,
   // Whether the server said it multiplexes connections (FCGI_MPXS_CONNS).
-  // Only such a server is sure to take FCGI_ABORT_REQUEST: php-fpm reads it
-  // as the start of the next request and closes a kept-alive connection.
+  // Every server gets FCGI_ABORT_REQUEST, but one that doesn't multiplex
+  // may not read it until its request ended: php-fpm then reads it as the
+  // start of the next request and closes a kept-alive connection. So such a
+  // connection takes no request after an abort.
   multiplexes: AtomicBool,
   // Wakes SendRequest::idle when in_flight drops to 0 or the connection ends.
   settled: tokio::sync::Notify,
@@ -988,8 +968,6 @@ where
     // ------------------------------------------------------------------
     // 2. Drain STDIN from pending requests that still have a body
     // ------------------------------------------------------------------
-    // A body failed on a connection that can't abort its request.
-    let mut cant_abort = false;
     // Whether a body has more to give than the queue takes now.
     let mut held_back = false;
     for (&request_id, pending) in this.pending.iter_mut() {
@@ -1032,7 +1010,7 @@ where
           pending.body = None;
           // Nor may a response that has started look whole: its reader
           // fails. Closed, the stdout channel also makes step 5 abort the
-          // request on a connection that multiplexes.
+          // request.
           if pending.stdout_tx.close() {
             // Closed now.
           } else {
@@ -1049,9 +1027,6 @@ where
             // The response came already; its body fails instead.
             None => drop(err),
           }
-          if !this.shared.multiplexes.load(Ordering::Relaxed) {
-            cant_abort = true;
-          }
           continue;
         }
         if body_done {
@@ -1063,12 +1038,6 @@ where
         }
       }
     }
-    if cant_abort {
-      // Requests waiting for this connection go elsewhere.
-      refuse_waiting(this.send_request_rx.as_ref().get_ref(), this.shared);
-      return Poll::Ready(Err(std::io::Error::other(BodyCutOff)));
-    }
-
     // ------------------------------------------------------------------
     // 3. Flush the write queue to the FramedWrite
     // ------------------------------------------------------------------
@@ -1197,14 +1166,16 @@ where
     // 5. Poll response-conversion futures and clean up finished requests
     // ------------------------------------------------------------------
     let mut finished_ids: Vec<u16> = Vec::new();
+    // An abort went to a server that doesn't multiplex.
+    let mut aborted_one_at_a_time = false;
     for (&request_id, pending) in this.pending.iter_mut() {
       let delivered = pending.deliver_unread(cx);
       while let Poll::Ready(Some(())) = pending.response_futures.poll_next_unpin(cx) {}
 
       // The response was dropped before it ended, or the caller stopped
-      // waiting for its headers: the server can stop.
-      if this.shared.multiplexes.load(Ordering::Relaxed)
-        && pending.aborted.is_none()
+      // waiting for its headers, or the request body failed: the server can
+      // stop.
+      if pending.aborted.is_none()
         && !pending.stdout_ended
         && !pending.end_received
         && (pending.stdout_tx.is_closed() || headers_abandoned(&pending.res_ch))
@@ -1216,6 +1187,9 @@ where
           .push_back(Record::new(RecordType::AbortRequest.as_u8(), request_id, vec![]));
         // Flush the write queue.
         cx.waker().wake_by_ref();
+        if !this.shared.multiplexes.load(Ordering::Relaxed) {
+          aborted_one_at_a_time = true;
+        }
       }
 
       // A request is fully done when END_REQUEST arrived, its STDOUT has
@@ -1223,6 +1197,12 @@ where
       if pending.end_received && delivered && pending.response_futures.is_empty() {
         finished_ids.push(request_id);
       }
+    }
+    if aborted_one_at_a_time {
+      // The server may read the abort only after this request, as the
+      // start of the next one: the connection takes no other request, and
+      // ends once the server has ended this one.
+      refuse_waiting(this.send_request_rx.as_ref().get_ref(), this.shared);
     }
     if !finished_ids.is_empty() {
       // Waiting requests may start now.
@@ -1499,7 +1479,11 @@ impl Builder {
   /// request keeps its place on the connection, and the connection never
   /// becomes idle. `timer` gives the connection its sleeps. Off by default.
   ///
-  /// Only a server that multiplexes connections gets `FCGI_ABORT_REQUEST`.
+  /// Every server gets `FCGI_ABORT_REQUEST`. On a connection to a server
+  /// that doesn't multiplex, the connection takes no request after an
+  /// abort and ends once the server has ended the aborted one: such a
+  /// server may read the abort only then, as php-fpm does, which reads it as
+  /// the start of the next request.
   pub fn abort_timeout(&mut self, after: Duration, timer: Arc<dyn Timer>) -> &mut Self {
     self.abort_timeout = Some(AbortTimeout { after, timer });
     self
@@ -2417,13 +2401,14 @@ mod tests {
 
   /// Gets a response from [`serve_held_response`] through a connection made
   /// by `builder`, reads its body if `read_body`, drops it, and returns
-  /// whether the server got `FCGI_ABORT_REQUEST`.
+  /// whether the server got `FCGI_ABORT_REQUEST` and whether the connection
+  /// took no more requests while the server still ran the request.
   async fn drop_held_response(
     builder: &Builder,
     values: &'static [(&str, &str)],
     end_stdout: bool,
     read_body: bool,
-  ) -> bool {
+  ) -> (bool, bool) {
     let held = if end_stdout { Held::BodyEnded } else { Held::InBody };
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     let (end_tx, end_rx) = tokio::sync::oneshot::channel();
@@ -2451,12 +2436,14 @@ mod tests {
     for _ in 0..10 {
       tokio::task::yield_now().await;
     }
+    // Before the server ends the request and closes its side.
+    let closed = send_req.is_closed();
     end_tx.send(()).unwrap();
 
     let aborted = server.await.unwrap();
     drop(send_req);
     connection.await.unwrap().unwrap();
-    aborted
+    (aborted, closed)
   }
 
   /// Hands a request to a connection made by `builder` to a server that
@@ -2517,34 +2504,48 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_no_abort_before_the_headers_without_multiplexing() {
-    // php-fpm doesn't know FCGI_ABORT_REQUEST; the request finishes when
-    // the server ends it.
+  async fn test_a_request_nobody_waits_for_is_aborted_before_its_headers_without_multiplexing() {
+    // A server that runs one request at a time gets the abort too.
+    // Before: it got nothing, and ran the request to its end.
     let builder = Builder::new().keepalive(true).clone();
-    assert_eq!(stop_waiting_for_headers(&builder, &[]).await, (false, 0));
+    assert_eq!(stop_waiting_for_headers(&builder, &[]).await, (true, 0));
   }
 
   #[tokio::test]
   async fn test_dropped_response_aborts_request() {
     let builder = Builder::new().keepalive(true).get_values(true).clone();
-    assert!(drop_held_response(&builder, MULTIPLEXES, false, false).await);
+    assert_eq!(
+      drop_held_response(&builder, MULTIPLEXES, false, false).await,
+      (true, false),
+      "a multiplexed connection runs on"
+    );
   }
 
   #[tokio::test]
   async fn test_response_read_to_the_end_is_not_aborted() {
     // STDOUT has ended, but END_REQUEST is still to come.
     let builder = Builder::new().keepalive(true).get_values(true).clone();
-    assert!(!drop_held_response(&builder, MULTIPLEXES, true, true).await);
+    assert_eq!(
+      drop_held_response(&builder, MULTIPLEXES, true, true).await,
+      (false, false)
+    );
+    let builder = Builder::new().keepalive(true).clone();
+    assert_eq!(drop_held_response(&builder, &[], true, true).await, (false, false));
   }
 
   #[tokio::test]
-  async fn test_no_abort_without_multiplexing() {
-    // php-fpm doesn't know FCGI_ABORT_REQUEST, and would read it as the
-    // start of the next request on a kept-alive connection.
+  async fn test_dropped_response_aborts_request_without_multiplexing() {
+    // The server gets the abort, and the connection takes no request after
+    // it: php-fpm reads an abort only after its request, as the start of
+    // the next one, and then closes the connection.
+    // Before: no abort, and the connection went on.
     let builder = Builder::new().keepalive(true).clone();
-    assert!(!drop_held_response(&builder, &[], false, false).await);
+    assert_eq!(drop_held_response(&builder, &[], false, false).await, (true, true));
     let builder = Builder::new().keepalive(true).get_values(true).clone();
-    assert!(!drop_held_response(&builder, &[("FCGI_MPXS_CONNS", "0")], false, false).await);
+    assert_eq!(
+      drop_held_response(&builder, &[("FCGI_MPXS_CONNS", "0")], false, false).await,
+      (true, true)
+    );
   }
 
   #[tokio::test]
@@ -3618,53 +3619,53 @@ mod hardening_tests {
     }
   }
 
-  /// A body that fails ends the connection, on a server that doesn't
-  /// multiplex: php-fpm learns of it only so. STDIN doesn't end, and the
-  /// caller gets the body's error.
-  /// Before: STDIN ended as if the body were whole, and then a second time.
+  /// A body that fails aborts its request on a server that doesn't
+  /// multiplex too: STDIN doesn't end, the caller gets the body's error, and
+  /// the connection takes no other request and ends once the server has
+  /// ended this one.
+  /// Before: the connection ended at once with `BodyCutOff`, no abort.
   #[tokio::test]
-  async fn a_failed_request_body_ends_a_connection_that_cant_abort() {
+  async fn a_failed_request_body_aborts_its_request_without_multiplexing() {
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let (server_read, server_write) = tokio::io::split(server_io);
+    let mut server = FramedRead::new(server_read, Decoder::default());
+    let server_out = FramedWrite::new(server_write, Encoder);
+    let backend = tokio::spawn(async move {
+      let mut stdin = Vec::new();
+      loop {
+        let record = server.next().await.expect("a record").expect("a valid record");
+        if record.record_type == RecordType::Stdin.as_u8() {
+          assert!(!record.content.is_empty(), "STDIN doesn't end");
+          stdin.extend_from_slice(&record.content);
+        }
+        if record.record_type == RecordType::AbortRequest.as_u8() {
+          return (record.request_id, stdin, server, server_out);
+        }
+      }
+    });
     let (send_req, connection) = handshake::<tokio::io::DuplexStream, Streamed>(client_io, true)
       .await
       .unwrap();
     let driver = tokio::spawn(connection);
-    let sending = tokio::spawn(async move {
-      let result = send_req.send_request(request(failing_body()), CgiBuilder::new()).await;
-      (result, send_req)
-    });
-    let (server_read, server_write) = tokio::io::split(server_io);
-    let mut server = FramedRead::new(server_read, Decoder::default());
+    let result = send_req.send_request(request(failing_body()), CgiBuilder::new()).await;
+    assert!(body_failed(&result));
 
+    assert!(settles(&backend).await, "the server gets FCGI_ABORT_REQUEST");
+    let (request_id, stdin, server, mut server_out) = backend.await.unwrap();
+    assert_eq!(stdin, b"part");
+    assert!(send_req.is_closed(), "no other request after the abort");
+    assert!(!driver.is_finished(), "the connection waits for the server");
+    server_out
+      .send(Record::new(RecordType::EndRequest.as_u8(), request_id, vec![0; 8]))
+      .await
+      .unwrap();
     assert!(settles(&driver).await, "the connection ends");
     match driver.await.unwrap() {
-      Ok(closed) => panic!("the connection ends with an error, not {closed:?}"),
-      Err(err) => assert_eq!(
-        err.get_ref().and_then(|inner| inner.downcast_ref::<BodyCutOff>()),
-        Some(&BodyCutOff)
-      ),
+      Ok(Closed::ByClient | Closed::ByServer) => {}
+      Err(err) => panic!("the connection ends without an error: {err}"),
     }
-    let (result, send_req) = sending.await.unwrap();
-    assert!(body_failed(&result));
-    assert!(send_req.is_closed());
     assert_eq!(send_req.idle().await, Settled::Ended);
-
-    let mut stdin = Vec::new();
-    while let Some(record) = server.next().await {
-      let record = record.expect("a valid record");
-      if record.record_type == RecordType::Stdin.as_u8() {
-        assert!(!record.content.is_empty(), "STDIN doesn't end");
-        stdin.extend_from_slice(&record.content);
-      }
-      assert_ne!(
-        record.record_type,
-        RecordType::AbortRequest.as_u8(),
-        "php-fpm doesn't know it"
-      );
-    }
-    // The connection may end before it has written what it had queued.
-    assert!(b"part".starts_with(&stdin), "{stdin:?}");
-    drop(server_write);
+    drop((server, server_out));
   }
 
   /// A body that fails aborts its request on a server that multiplexes; the
