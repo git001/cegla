@@ -426,6 +426,16 @@ fn send_stdout(
   }
 }
 
+/// The most bytes of records waiting to be written before the connection
+/// stops taking more of the request bodies: a body goes to the server about
+/// as fast as the server reads it, not into memory ahead of it.
+const MAX_QUEUED: usize = 64 * 1024;
+
+/// The bytes of the records in `queue`.
+fn queued_bytes(queue: &VecDeque<Record>) -> usize {
+  queue.iter().map(|record| record.content.len()).sum()
+}
+
 /// Stops `rx` from taking requests, and answers the ones still waiting in it
 /// with [`NotSent::Closed`]: they are never sent.
 fn refuse_waiting<B>(rx: &async_channel::Receiver<SentRequest<B>>, shared: &Shared) {
@@ -840,11 +850,19 @@ where
     // ------------------------------------------------------------------
     // A body failed on a connection that can't abort its request.
     let mut cant_abort = false;
+    // Whether a body has more to give than the queue takes now.
+    let mut held_back = false;
     for (&request_id, pending) in this.pending.iter_mut() {
       if let Some(ref mut body) = pending.body {
         let mut body_done = false;
         let mut failed = None;
         loop {
+          if queued_bytes(this.write_queue) >= MAX_QUEUED {
+            // The server reads slower than the body comes: take more once
+            // the queue has gone to it.
+            held_back = true;
+            break;
+          }
           match body.as_mut().poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
               if let Ok(data) = frame.into_data() {
@@ -932,6 +950,11 @@ where
     // Flush any buffered data.
     if let Poll::Ready(Err(e)) = this.writer.as_mut().poll_flush(cx) {
       return Poll::Ready(Err(e));
+    }
+    if held_back && queued_bytes(this.write_queue) < MAX_QUEUED {
+      // Room again: take more of the bodies. Otherwise the writer wakes the
+      // connection once the server has read.
+      cx.waker().wake_by_ref();
     }
 
     // ------------------------------------------------------------------
@@ -3165,15 +3188,35 @@ mod known_issue_tests {
     drop((server, server_out));
   }
 
-  /// Right: STDIN goes to the server about as fast as the server reads it.
-  /// Today: the connection takes the whole request body at once and queues
-  /// it in memory, however little the server reads.
+  /// STDIN goes to the server about as fast as the server reads it: the
+  /// connection takes no more of the body than [`MAX_QUEUED`] ahead of what
+  /// the server has read, and the whole body once the server reads it.
+  /// Before: it took the whole body at once and queued it in memory.
   #[tokio::test]
-  async fn known_issue_a_request_body_is_queued_whole() {
+  async fn a_request_body_goes_as_fast_as_the_server_reads() {
+    let ahead = send_a_body_to_a_slow_server(4096).await;
+    // The queue, the writer's buffer and the pipe.
+    assert!(
+      ahead <= MAX_QUEUED + 32 * 1024,
+      "{} KiB of the body taken ahead of the server",
+      ahead / 1024
+    );
+  }
+
+  /// A pipe that takes a whole queue at once leaves nothing to wake the
+  /// connection for more of the body: it wakes itself.
+  #[tokio::test]
+  async fn a_request_body_goes_on_when_the_pipe_takes_the_queue() {
+    send_a_body_to_a_slow_server(1 << 20).await;
+  }
+
+  /// Sends a 1 MiB body to a server that reads nothing at first, through a
+  /// pipe of `pipe` bytes; how much of it the connection took by then. Then
+  /// the server reads the whole body.
+  async fn send_a_body_to_a_slow_server(pipe: usize) -> usize {
     const CHUNKS: usize = 256;
     const CHUNK: usize = 4096;
-    // The server reads nothing, so about this much can leave the queue.
-    let (client_io, server_io) = tokio::io::duplex(CHUNK);
+    let (client_io, server_io) = tokio::io::duplex(pipe);
     let (send_req, connection) = handshake::<tokio::io::DuplexStream, Streamed>(client_io, true)
       .await
       .unwrap();
@@ -3188,15 +3231,28 @@ mod known_issue_tests {
     let sending = tokio::spawn(async move { send_req.send_request(request(body), CgiBuilder::new()).await });
     let driver = tokio::spawn(connection);
 
-    assert!(
-      comes_true(|| taken.load(Ordering::Relaxed) == CHUNKS).await,
-      "known issue: the whole body of {} KiB is taken",
-      CHUNKS * CHUNK / 1024
-    );
+    yield_rounds(2000).await;
+    let ahead = taken.load(Ordering::Relaxed) * CHUNK;
+    assert!(ahead > 0, "the body starts");
+
+    // Counter-check: the server reading takes the whole body, in order.
+    let (server_read, server_write) = tokio::io::split(server_io);
+    let mut server = FramedRead::new(server_read, Decoder::default());
+    let (request_id, stdin) = read_request(&mut server).await;
+    assert_eq!(taken.load(Ordering::Relaxed), CHUNKS);
+    assert_eq!(stdin.len(), CHUNKS * CHUNK);
+    for (index, chunk) in stdin.chunks(CHUNK).enumerate() {
+      let byte = u8::try_from(index % 256).expect("below 256");
+      assert!(
+        chunk.iter().all(|&got| got == byte),
+        "chunk {index} of request {request_id}"
+      );
+    }
     assert!(!sending.is_finished(), "the server has not answered");
     sending.abort();
     driver.abort();
-    drop(server_io);
+    drop(server_write);
+    ahead
   }
 
   /// A body that fails after "part".
