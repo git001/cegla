@@ -9,6 +9,7 @@ use std::{
     Arc,
   },
   task::{Context, Poll},
+  time::Instant,
 };
 
 use cegla::{client::convert_to_http_response, CgiIncoming};
@@ -170,6 +171,40 @@ impl std::fmt::Display for RequestRejected {
 
 impl std::error::Error for RequestRejected {}
 
+/// The connection never sent the request to the FastCGI server, so sending
+/// it again on another connection is safe, even if it isn't idempotent.
+///
+/// [`SendRequest::send_request`] returns it inside a [`std::io::Error`]; get
+/// it with [`std::io::Error::get_ref`] and `downcast_ref`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotSent {
+  /// The connection was closed, or stopped taking requests, first.
+  Closed,
+  /// The connection had no FastCGI request ID left for the request.
+  NoRequestId,
+}
+
+impl std::fmt::Display for NotSent {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      NotSent::Closed => write!(f, "FastCGI connection closed before the request was sent"),
+      NotSent::NoRequestId => write!(f, "no FastCGI request IDs available"),
+    }
+  }
+}
+
+impl std::error::Error for NotSent {}
+
+/// An error for a request the connection never sent, with the kind it has
+/// always had for `why`.
+fn not_sent(why: NotSent) -> std::io::Error {
+  let kind = match why {
+    NotSent::Closed => std::io::ErrorKind::ConnectionAborted,
+    NotSent::NoRequestId => std::io::ErrorKind::WouldBlock,
+  };
+  std::io::Error::new(kind, why)
+}
+
 // ---------------------------------------------------------------------------
 // Shared (state of SendRequest handles and their Connection)
 // ---------------------------------------------------------------------------
@@ -188,6 +223,10 @@ struct Shared {
   multiplexes: AtomicBool,
   // Wakes SendRequest::idle when in_flight drops to 0 or the connection ends.
   settled: tokio::sync::Notify,
+  // Since when no request runs, or `None` while one does. Changed together
+  // with in_flight's way to and from 0, under this lock, so two threads
+  // can't leave it saying idle while a request runs.
+  idle_since: parking_lot::Mutex<Option<Instant>>,
   // Whether the Connection is gone.
   ended: AtomicBool,
 }
@@ -200,14 +239,26 @@ impl Shared {
       waker: AtomicWaker::new(),
       multiplexes: AtomicBool::new(multiplexes),
       settled: tokio::sync::Notify::new(),
+      idle_since: parking_lot::Mutex::new(Some(Instant::now())),
       ended: AtomicBool::new(false),
+    }
+  }
+
+  /// Counts a request up; the connection isn't idle any more.
+  fn start_request(&self) {
+    let mut idle_since = self.idle_since.lock();
+    if self.in_flight.fetch_add(1, Ordering::AcqRel) == 0 {
+      *idle_since = None;
     }
   }
 
   /// Counts a finished request down, and wakes those waiting for the
   /// connection to be idle if it was the last one.
   fn finish_request(&self) {
+    let mut idle_since = self.idle_since.lock();
     if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+      *idle_since = Some(Instant::now());
+      drop(idle_since);
       self.settled.notify_waiters();
     }
   }
@@ -293,6 +344,22 @@ fn send_stdout(
   }
 }
 
+/// Stops `rx` from taking requests, and answers the ones still waiting in it
+/// with [`NotSent::Closed`]: they are never sent.
+fn refuse_waiting<B>(rx: &async_channel::Receiver<SentRequest<B>>, shared: &Shared) {
+  if rx.close() {
+    // Closed now: requests that were waiting are refused below.
+  } else {
+    // Closed before, by SendRequest::close or an earlier refusal: requests
+    // still waiting are refused below all the same.
+  }
+  while let Ok(SentRequest { req, builder, res_ch }) = rx.try_recv() {
+    drop((req, builder));
+    shared.finish_request();
+    answer(res_ch, Err(not_sent(NotSent::Closed)));
+  }
+}
+
 /// Sends `result` to the caller of [`SendRequest::send_request`].
 fn answer<T>(ch: oneshot::Sender<T>, result: T) {
   match ch.send(result) {
@@ -344,28 +411,42 @@ where
   > {
     let (res_ch, res_rx) = oneshot::channel();
     // The connection counts the request down when it's finished.
-    self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
-    if self
-      .send_request_tx
-      .send(SentRequest { req, builder, res_ch })
-      .await
-      .is_err()
-    {
+    self.shared.start_request();
+    if let Err(unsent) = self.send_request_tx.send(SentRequest { req, builder, res_ch }).await {
+      // The request comes back unsent.
+      drop(unsent);
       self.shared.finish_request();
-      return Err(std::io::Error::new(
-        std::io::ErrorKind::UnexpectedEof,
-        "underlying connection closed",
-      ));
+      return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, NotSent::Closed));
     }
-    res_rx
-      .await
-      .map_err(|_| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "unknown error obtaining response"))?
+    res_rx.await.map_err(|gone| {
+      std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        format!("unknown error obtaining response: {gone}"),
+      )
+    })?
   }
 
   /// The requests on the connection that haven't finished: running, or
   /// sent and waiting for room.  `0` means the connection is idle.
   pub fn in_flight(&self) -> usize {
     self.shared.in_flight.load(Ordering::Relaxed)
+  }
+
+  /// Since when no request runs on the connection, or `None` while one
+  /// does. A new connection is idle since its handshake.
+  pub fn idle_since(&self) -> Option<Instant> {
+    *self.shared.idle_since.lock()
+  }
+
+  /// Stops the connection from taking new requests; returns whether this
+  /// call did, `false` if it already had.
+  ///
+  /// Requests already handed to the connection run to their end, and the
+  /// connection ends after them with [`Closed::ByClient`]. A request sent
+  /// afterwards fails with [`NotSent::Closed`]. [`SendRequest::is_closed`]
+  /// is `true` from now on.
+  pub fn close(&self) -> bool {
+    self.send_request_tx.close()
   }
 
   /// Waits until no request runs on the connection any more, or the
@@ -446,11 +527,9 @@ where
             Some(id) => id,
             None => {
               // No IDs available – reject immediately.
+              drop((req, builder));
               this.shared.finish_request();
-              let _ = res_ch.send(Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "no FastCGI request IDs available",
-              )));
+              answer(res_ch, Err(not_sent(NotSent::NoRequestId)));
               continue;
             }
           };
@@ -711,16 +790,9 @@ where
                   Some(ProtocolStatus::Overloaded | ProtocolStatus::UnknownRole) => {
                     // The server asks not to send more requests on this
                     // connection; it ends once the open requests have.
-                    this.send_request_rx.close();
-                    while let Ok(SentRequest { res_ch, .. }) = this.send_request_rx.try_recv() {
-                      this.shared.finish_request();
-                      let _ = res_ch.send(Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionAborted,
-                        "FastCGI connection closed before the request was sent",
-                      )));
-                    }
+                    refuse_waiting(this.send_request_rx.as_ref().get_ref(), this.shared);
                   }
-                  _ => {}
+                  Some(ProtocolStatus::RequestComplete) | None => {}
                 }
                 if let Some(status) = status.filter(|&status| status != ProtocolStatus::RequestComplete) {
                   if let Some(ch) = pending.res_ch.lock().unwrap().take() {
@@ -796,19 +868,7 @@ where
       if !cut_off.is_empty() {
         *this.cut_off += cut_off.len();
         // No more requests can be sent on this connection.
-        this.send_request_rx.close();
-        while let Ok(SentRequest { req, builder, res_ch }) = this.send_request_rx.try_recv() {
-          // The request is never sent.
-          drop((req, builder));
-          this.shared.finish_request();
-          answer(
-            res_ch,
-            Err(std::io::Error::new(
-              std::io::ErrorKind::ConnectionAborted,
-              "FastCGI connection closed before the request was sent",
-            )),
-          );
-        }
+        refuse_waiting(this.send_request_rx.as_ref().get_ref(), this.shared);
       }
       for request_id in cut_off {
         if let Some(pending) = this.pending.remove(&request_id) {
@@ -2276,5 +2336,139 @@ mod cut_off_tests {
     assert!(settles(&response).await, "the response fails");
     assert!(response.await.unwrap().is_err());
     drop(server_io);
+  }
+
+  /// The [`NotSent`] inside `err`, if any.
+  fn not_sent_of(err: &std::io::Error) -> Option<NotSent> {
+    err.get_ref().and_then(|inner| inner.downcast_ref::<NotSent>()).copied()
+  }
+
+  fn get() -> http::Request<http_body_util::Full<Bytes>> {
+    http::Request::builder()
+      .uri("http://backend/")
+      .body(http_body_util::Full::<Bytes>::from(""))
+      .unwrap()
+  }
+
+  #[tokio::test]
+  async fn idle_since_follows_the_requests() {
+    let before = Instant::now();
+    let (send_req, driver, mut server_io, response) = running_request().await;
+    assert_eq!(send_req.idle_since(), None, "a request runs");
+
+    let mut answer = record(RecordType::Stdout, b"Content-Type: text/plain\r\n\r\ndone");
+    answer.extend(record(RecordType::Stdout, b""));
+    answer.extend(end_request());
+    let answered = Instant::now();
+    server_io.write_all(&answer).await.unwrap();
+    assert!(settles(&response).await, "the response ends");
+    assert_eq!(
+      response.await.unwrap().expect("a response"),
+      Bytes::from_static(b"done")
+    );
+    let idle = send_req.idle().await;
+    assert_eq!(idle, Settled::Idle);
+    match send_req.idle_since() {
+      Some(since) => assert!(since >= answered && since > before, "idle since the request ended"),
+      None => panic!("the connection is idle"),
+    }
+    driver.abort();
+  }
+
+  #[tokio::test]
+  async fn a_new_connection_is_idle_since_its_handshake() {
+    let before = Instant::now();
+    let (client_io, server_io) = tokio::io::duplex(65536);
+    let (send_req, connection) = handshake::<tokio::io::DuplexStream, http_body_util::Full<Bytes>>(client_io, true)
+      .await
+      .unwrap();
+    match send_req.idle_since() {
+      Some(since) => assert!(since >= before),
+      None => panic!("no request runs"),
+    }
+    drop((connection, server_io));
+  }
+
+  #[tokio::test]
+  async fn close_lets_the_running_request_end_and_then_ends_the_connection() {
+    let (send_req, driver, mut server_io, response) = running_request().await;
+    assert!(send_req.close(), "this call closes the connection");
+    assert!(!send_req.close(), "it is closed already");
+    assert!(send_req.is_closed());
+
+    match send_req.send_request(get(), CgiBuilder::new()).await {
+      Ok(response) => panic!("a closed connection sent a request: {:?}", response.0.status()),
+      Err(err) => assert_eq!(not_sent_of(&err), Some(NotSent::Closed)),
+    }
+    assert_eq!(send_req.in_flight(), 1, "the refused request isn't counted");
+
+    let mut answer = record(RecordType::Stdout, b"Content-Type: text/plain\r\n\r\ndone");
+    answer.extend(record(RecordType::Stdout, b""));
+    answer.extend(end_request());
+    server_io.write_all(&answer).await.unwrap();
+    assert!(settles(&response).await, "the running request ends");
+    assert_eq!(
+      response.await.unwrap().expect("a response"),
+      Bytes::from_static(b"done")
+    );
+    assert!(settles(&driver).await, "the connection ends after it");
+    assert_eq!(driver.await.unwrap().expect("without an error"), Closed::ByClient);
+    drop((send_req, server_io));
+  }
+
+  #[tokio::test]
+  async fn a_request_waiting_when_the_server_closes_was_not_sent() {
+    let (client_io, mut server_io) = tokio::io::duplex(65536);
+    let (send_req, connection) = Builder::new()
+      .keepalive(true)
+      .max_requests(1)
+      .handshake::<tokio::io::DuplexStream, http_body_util::Full<Bytes>>(client_io)
+      .await
+      .unwrap();
+    let driver = tokio::spawn(connection);
+    let requests = [send_req.clone(), send_req.clone()].map(|sender| {
+      tokio::spawn(async move {
+        match sender.send_request(get(), CgiBuilder::new()).await {
+          Ok(response) => Ok(response.0.status()),
+          Err(err) => Err(err),
+        }
+      })
+    });
+    let mut request = vec![0u8; 4096];
+    let read = server_io.read(&mut request).await.unwrap();
+    assert!(read > 0, "the first request arrives");
+    assert!(comes_true(|| send_req.in_flight() == 2).await, "the second one waits");
+
+    drop(server_io);
+    let mut outcomes = Vec::new();
+    for request in requests {
+      assert!(settles(&request).await, "each request ends");
+      match request.await.unwrap() {
+        Ok(status) => panic!("no response comes: {status}"),
+        Err(err) => outcomes.push((err.kind(), not_sent_of(&err))),
+      }
+    }
+    outcomes.sort_by_key(|(kind, why)| (*why == Some(NotSent::Closed), format!("{kind:?}")));
+    assert_eq!(
+      outcomes,
+      [
+        (std::io::ErrorKind::UnexpectedEof, None),
+        (std::io::ErrorKind::ConnectionAborted, Some(NotSent::Closed)),
+      ],
+      "the running request was cut off, the waiting one never sent"
+    );
+    assert!(settles(&driver).await);
+    assert!(driver.await.unwrap().is_err(), "a request was cut off");
+  }
+
+  /// Yields until `done` holds, as long as a ready task could take; whether
+  /// it does by then.
+  async fn comes_true(done: impl Fn() -> bool) -> bool {
+    let mut rounds = 0;
+    while rounds < 2000 && !done() {
+      tokio::task::yield_now().await;
+      rounds += 1;
+    }
+    done()
   }
 }
