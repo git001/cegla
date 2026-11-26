@@ -3082,9 +3082,11 @@ mod cut_off_tests {
 }
 
 #[cfg(test)]
-mod known_issue_tests {
-  //! Behaviour that is wrong today. Each test shows the issue as it is, so a
-  //! fix has to change the test; its comment says what would be right.
+mod hardening_tests {
+  //! How the client holds up against servers and callers that misbehave:
+  //! slow or missing readers on either side, bodies that fail, and aborts
+  //! the server doesn't answer. Most were known issues first; a test's
+  //! comment says what happened before, where it helps.
 
   use std::sync::atomic::AtomicUsize;
 
