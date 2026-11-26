@@ -280,6 +280,27 @@ impl std::error::Error for ResponseUnread {}
 /// connection that multiplexes, see [`Builder::max_unread`].
 const DEFAULT_MAX_UNREAD: usize = 1024 * 1024;
 
+/// A request body failed on a connection that can't abort the request, so
+/// the connection ended: only that tells a server that doesn't multiplex,
+/// php-fpm say, that the body was cut off. The request itself fails with
+/// [`RequestBodyFailed`].
+///
+/// The [`Connection`] ends with it inside a [`std::io::Error`]; get it with
+/// [`std::io::Error::get_ref`] and `downcast_ref`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyCutOff;
+
+impl std::fmt::Display for BodyCutOff {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "a request body failed on a FastCGI connection that can't abort the request"
+    )
+  }
+}
+
+impl std::error::Error for BodyCutOff {}
+
 /// Sleeps for the timeouts a [`Connection`] keeps, from whichever async
 /// runtime drives it.
 pub trait Timer: Send + Sync {
@@ -1045,9 +1066,7 @@ where
     if cant_abort {
       // Requests waiting for this connection go elsewhere.
       refuse_waiting(this.send_request_rx.as_ref().get_ref(), this.shared);
-      return Poll::Ready(Err(std::io::Error::other(
-        "a request body failed on a FastCGI connection that can't abort the request",
-      )));
+      return Poll::Ready(Err(std::io::Error::other(BodyCutOff)));
     }
 
     // ------------------------------------------------------------------
@@ -3618,7 +3637,10 @@ mod known_issue_tests {
     assert!(settles(&driver).await, "the connection ends");
     match driver.await.unwrap() {
       Ok(closed) => panic!("the connection ends with an error, not {closed:?}"),
-      Err(err) => assert!(err.to_string().contains("can't abort"), "{err}"),
+      Err(err) => assert_eq!(
+        err.get_ref().and_then(|inner| inner.downcast_ref::<BodyCutOff>()),
+        Some(&BodyCutOff)
+      ),
     }
     let (result, send_req) = sending.await.unwrap();
     assert!(body_failed(&result));
