@@ -369,6 +369,66 @@ fn refuse_waiting<B>(rx: &async_channel::Receiver<SentRequest<B>>, shared: &Shar
 }
 
 /// Sends `result` to the caller of [`SendRequest::send_request`].
+/// The response of a request handed to a connection, as the caller waits
+/// for it.
+///
+/// Dropped before the response came, it wakes the connection, so the
+/// connection can abort the request nobody waits for any more.
+struct AwaitResponse {
+  // `None` once the response came.
+  rx: Option<oneshot::AsyncReceiver<ResponseResult>>,
+  shared: Arc<Shared>,
+}
+
+impl Future for AwaitResponse {
+  type Output = ResponseResult;
+
+  fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ResponseResult> {
+    let Some(rx) = self.rx.as_mut() else {
+      return Poll::Ready(Err(std::io::Error::other("the response was already taken")));
+    };
+    match Pin::new(rx).poll(cx) {
+      Poll::Ready(received) => {
+        self.rx = None;
+        Poll::Ready(match received {
+          Ok(result) => result,
+          Err(gone) => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("unknown error obtaining response: {gone}"),
+          )),
+        })
+      }
+      Poll::Pending => Poll::Pending,
+    }
+  }
+}
+
+impl Drop for AwaitResponse {
+  fn drop(&mut self) {
+    if let Some(rx) = self.rx.take() {
+      // Close first, so the connection sees no one waiting when it wakes.
+      drop(rx);
+      self.shared.waker.wake();
+    }
+  }
+}
+
+/// Whether the caller stopped waiting for the response headers of the
+/// request whose response channel is `res_ch`.
+fn headers_abandoned(res_ch: &std::sync::Mutex<Option<oneshot::Sender<ResponseResult>>>) -> bool {
+  let res_ch = match res_ch.lock() {
+    Ok(res_ch) => res_ch,
+    // A response future panicked while it held the lock; the channel is
+    // still whole.
+    Err(poisoned) => poisoned.into_inner(),
+  };
+  match res_ch.as_ref() {
+    Some(ch) => ch.is_closed(),
+    // The response, or a rejection, was sent: the reader is watched instead.
+    None => false,
+  }
+}
+
 fn answer<T>(ch: oneshot::Sender<T>, result: T) {
   match ch.send(result) {
     Ok(()) => {}
@@ -444,13 +504,9 @@ where
     // The connection counts the request down when it's finished.
     self.shared.start_request();
     match self.send_request_tx.try_send(SentRequest { req, builder, res_ch }) {
-      Ok(()) => Ok(async move {
-        res_rx.await.map_err(|gone| {
-          std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!("unknown error obtaining response: {gone}"),
-          )
-        })?
+      Ok(()) => Ok(AwaitResponse {
+        rx: Some(std::future::IntoFuture::into_future(res_rx)),
+        shared: Arc::clone(&self.shared),
       }),
       // The channel is unbounded, so it is only ever full if it is closed.
       Err(async_channel::TrySendError::Closed(sent) | async_channel::TrySendError::Full(sent)) => {
@@ -862,12 +918,13 @@ where
     for (&request_id, pending) in this.pending.iter_mut() {
       while let Poll::Ready(Some(())) = pending.response_futures.poll_next_unpin(cx) {}
 
-      // The response was dropped before it ended: the server can stop.
+      // The response was dropped before it ended, or the caller stopped
+      // waiting for its headers: the server can stop.
       if this.shared.multiplexes.load(Ordering::Relaxed)
         && !pending.aborted
         && !pending.stdout_ended
         && !pending.end_received
-        && pending.stdout_tx.is_closed()
+        && (pending.stdout_tx.is_closed() || headers_abandoned(&pending.res_ch))
       {
         pending.aborted = true;
         pending.body = None;
@@ -1919,14 +1976,26 @@ mod tests {
     }
   }
 
+  /// How far [`serve_held_response`] gets with its response before it
+  /// waits.
+  #[derive(Clone, Copy, Debug)]
+  enum Held {
+    /// Nothing is sent: the script runs.
+    BeforeHeaders,
+    /// The headers and the start of the body are sent.
+    InBody,
+    /// The whole body is sent, without `FCGI_END_REQUEST`.
+    BodyEnded,
+  }
+
   /// A FastCGI server for tests that answers `FCGI_GET_VALUES` with
-  /// `values` and starts one response, which ends STDOUT if `end_stdout`.  It
-  /// sends `FCGI_END_REQUEST` only once `end` fires, and returns whether an
+  /// `values` and gets as far with one response as `held` says.  It sends
+  /// `FCGI_END_REQUEST` only once `end` fires, and returns whether an
   /// `FCGI_ABORT_REQUEST` had arrived by then.
   async fn serve_held_response(
     io: tokio::io::DuplexStream,
     values: &[(&str, &str)],
-    end_stdout: bool,
+    held: Held,
     end: tokio::sync::oneshot::Receiver<()>,
   ) -> bool {
     use futures_util::{FutureExt, SinkExt};
@@ -1956,14 +2025,16 @@ mod tests {
       }
     }
     let request_id = request_id.unwrap();
-    let mut records = vec![Record::new(
+    let started = Record::new(
       RecordType::Stdout.as_u8(),
       request_id,
       b"Content-Type: text/plain\r\n\r\nstarted".to_vec(),
-    )];
-    if end_stdout {
-      records.push(Record::new(RecordType::Stdout.as_u8(), request_id, vec![]));
-    }
+    );
+    let records = match held {
+      Held::BeforeHeaders => vec![],
+      Held::InBody => vec![started],
+      Held::BodyEnded => vec![started, Record::new(RecordType::Stdout.as_u8(), request_id, vec![])],
+    };
     for record in records {
       writer.send(record).await.unwrap();
     }
@@ -1990,9 +2061,10 @@ mod tests {
     end_stdout: bool,
     read_body: bool,
   ) -> bool {
+    let held = if end_stdout { Held::BodyEnded } else { Held::InBody };
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     let (end_tx, end_rx) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(serve_held_response(server_io, values, end_stdout, end_rx));
+    let server = tokio::spawn(serve_held_response(server_io, values, held, end_rx));
     let (send_req, connection) = builder
       .handshake::<_, http_body_util::Full<Bytes>>(client_io)
       .await
@@ -2024,7 +2096,70 @@ mod tests {
     aborted
   }
 
+  /// Hands a request to a connection made by `builder` to a server that
+  /// sends nothing back, stops waiting for the response headers, and
+  /// returns whether the server got `FCGI_ABORT_REQUEST`, and how many
+  /// requests the connection still ran once the server ended the request.
+  async fn stop_waiting_for_headers(builder: &Builder, values: &'static [(&str, &str)]) -> (bool, usize) {
+    use futures_util::FutureExt;
+
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(serve_held_response(server_io, values, Held::BeforeHeaders, end_rx));
+    let (send_req, connection) = builder
+      .handshake::<_, http_body_util::Full<Bytes>>(client_io)
+      .await
+      .unwrap();
+    let connection = tokio::spawn(connection);
+
+    let request = http::Request::builder()
+      .method("GET")
+      .uri("http://example.com/")
+      .body(http_body_util::Full::<Bytes>::from(b"".as_ref()))
+      .unwrap();
+    let mut response = match send_req.try_send_request(request, CgiBuilder::new()) {
+      Ok(response) => Box::pin(response),
+      Err(unsent) => panic!("the connection takes the request: {:?}", unsent.request.uri()),
+    };
+    // Let the request reach the server.
+    for _ in 0..10 {
+      assert!((&mut response).now_or_never().is_none(), "no headers come");
+      tokio::task::yield_now().await;
+    }
+    // A response timeout, say.
+    drop(response);
+    // Nothing arrives from the server, so only the caller leaving can wake
+    // the connection.
+    for _ in 0..10 {
+      tokio::task::yield_now().await;
+    }
+    end_tx.send(()).unwrap();
+
+    let aborted = server.await.unwrap();
+    for _ in 0..10 {
+      tokio::task::yield_now().await;
+    }
+    let in_flight = send_req.in_flight();
+    drop(send_req);
+    connection.await.unwrap().unwrap();
+    (aborted, in_flight)
+  }
+
   const MULTIPLEXES: &[(&str, &str)] = &[("FCGI_MPXS_CONNS", "1")];
+
+  #[tokio::test]
+  async fn test_a_request_nobody_waits_for_is_aborted_before_its_headers() {
+    let builder = Builder::new().keepalive(true).get_values(true).clone();
+    assert_eq!(stop_waiting_for_headers(&builder, MULTIPLEXES).await, (true, 0));
+  }
+
+  #[tokio::test]
+  async fn test_no_abort_before_the_headers_without_multiplexing() {
+    // php-fpm doesn't know FCGI_ABORT_REQUEST; the request finishes when
+    // the server ends it.
+    let builder = Builder::new().keepalive(true).clone();
+    assert_eq!(stop_waiting_for_headers(&builder, &[]).await, (false, 0));
+  }
 
   #[tokio::test]
   async fn test_dropped_response_aborts_request() {
